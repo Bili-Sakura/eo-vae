@@ -1,12 +1,19 @@
+# MIT License
 
+# Copyright (c) 2022 Machine Vision and Learning Group, LMU Munich
+
+# Based on code: https://github.com/CompVis/latent-diffusion/blob/main/ldm/modules/encoders/modules.py
+
+import os
 import math
 import pdb
 import torch
 import torch.nn as nn
 import numpy as np
 from einops import rearrange
-from .dynamic_conv import DynamicConv, DynamicConv_decoder
+from .modules.dynamic_conv import DynamicConv, DynamicConv_decoder
 from typing import List, Tuple
+from torchvision.datasets.utils import download_url
 
 
 from .modules.layers import (
@@ -20,6 +27,8 @@ from .modules.layers import (
 
 
 class Encoder(nn.Module):
+    init_weight_gen_path = 'https://huggingface.co/nilsleh/eo-vae/main/resolve/encoder_dconv_weight_generator_init_0.01_er50k.pt'
+
     def __init__(
         self,
         *,
@@ -36,8 +45,7 @@ class Encoder(nn.Module):
         double_z: bool = True,
         **ignore_kwargs,
     ):
-        """
-        Encoder module that downsamples input images to latent representations.
+        """Encoder module that downsamples input images to latent representations.
 
         Args:
             ch: Base channel count
@@ -64,19 +72,24 @@ class Encoder(nn.Module):
         self.z_channels = z_channels
 
         # downsampling
-        #self.conv_in = torch.nn.Conv2d(
-        #    in_channels, self.ch, kernel_size=3, stride=1, padding=1
-        #)
-        #'''
         self.conv_in = DynamicConv(
-            wv_planes=128, inter_dim=128, kernel_size=3, stride=1, padding=1, embed_dim=self.ch
+            wv_planes=128,
+            inter_dim=128,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            embed_dim=self.ch,
         )
 
         # TODO: if training
-        wg_weights = torch.load('/home/xshadow/Datasets/eo-vae/src/models/encoder_dconv_weight_generator_init_0.01_er50k.pt')
-        self.conv_in.weight_generator.load_state_dict(wg_weights["weight_generator"])
-        self.conv_in.fclayer.load_state_dict(wg_weights["fclayer"])
-        #'''
+        # TODO need to handle this without fixed paths
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        path = os.path.join(
+            current_dir, 'encoder_dconv_weight_generator_init_0.01_er50k.pt'
+        )
+        wg_weights = torch.load(path, map_location='cpu')
+        self.conv_in.weight_generator.load_state_dict(wg_weights['weight_generator'])
+        self.conv_in.fclayer.load_state_dict(wg_weights['fclayer'])
 
         curr_res = resolution
         in_ch_mult = (1,) + tuple(ch_mult)
@@ -106,7 +119,6 @@ class Encoder(nn.Module):
                 down.downsample = Downsample(block_in, resamp_with_conv)
                 curr_res = curr_res // 2
             self.down.append(down)
-
         # middle
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(
@@ -139,8 +151,7 @@ class Encoder(nn.Module):
 
         # downsampling
         hs = [self.conv_in(x, wvs)]
-        #hs = [self.conv_in(x)]
-        
+
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
@@ -181,8 +192,7 @@ class Decoder(nn.Module):
         tanh_out: bool = False,
         **ignorekwargs,
     ):
-        """
-        Decoder module that upsamples latent representations to images.
+        """Decoder module that upsamples latent representations to images.
 
         Args:
             ch: Base channel count
@@ -271,15 +281,25 @@ class Decoder(nn.Module):
 
         # end
         self.norm_out = Normalize(block_in)
-        #self.conv_out = torch.nn.Conv2d(
-        #    block_in, out_ch, kernel_size=3, stride=1, padding=1
-        #)
+
         self.conv_out = DynamicConv_decoder(
-            wv_planes=128, inter_dim=128, kernel_size=3, stride=1, padding=1, embed_dim=block_in
+            wv_planes=128,
+            inter_dim=128,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            embed_dim=block_in,
         )
-        wg_weights = torch.load('/home/xshadow/Datasets/eo-vae/src/models/decoder_dconv_weight_generator_init_0.01_er50k.pt')
-        self.conv_out.weight_generator.load_state_dict(wg_weights["weight_generator"])
-        self.conv_out.fclayer.load_state_dict(wg_weights["fclayer"])
+        # TODO
+        # need to handle this without fixed paths
+
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        path = os.path.join(
+            current_dir, 'decoder_dconv_weight_generator_init_0.01_er50k.pt'
+        )
+        wg_weights = torch.load(path, map_location='cpu')
+        self.conv_out.weight_generator.load_state_dict(wg_weights['weight_generator'])
+        self.conv_out.fclayer.load_state_dict(wg_weights['fclayer'])
 
     def forward(self, z, wvs):
         # assert z.shape[1:] == self.z_shape[1:]
@@ -311,8 +331,8 @@ class Decoder(nn.Module):
 
         h = self.norm_out(h)
         h = nonlinearity(h)
-        h = self.conv_out(h,wvs)
-        #h = self.conv_out(h)
+        h = self.conv_out(h, wvs)
+        # h = self.conv_out(h)
         if self.tanh_out:
             h = torch.tanh(h)
         return h

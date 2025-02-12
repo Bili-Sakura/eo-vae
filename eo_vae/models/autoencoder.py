@@ -1,14 +1,19 @@
 # Based on https://github.com/CompVis/latent-diffusion/blob/main/ldm/models/autoencoder.py
-# which is released under MIT-License
+# MIT License
+
+# Copyright (c) 2022 Machine Vision and Learning Group, LMU Munich
+
 # - Adopted to support newer torch/lightning versions
 # - added docstrings and type annotations
 # - adopted for anysensor inputs
+# - manual optimization according to newer lightning version
 
 
 import torch
 import os
 from lightning import LightningModule
 import torch.nn.functional as F
+from torch import Tensor
 from typing import Any
 from torchvision.datasets.utils import download_url
 
@@ -29,23 +34,26 @@ class AutoencoderKL(LightningModule):
         ckpt_path: str | None = None,
         ignore_keys: list[str] = [],
         image_key: str = 'image',
+        learning_rate: float = 1e-5,
+        rgb_channel_indices: list[int] = [0, 1, 2],
         colorize_nlabels: int | None = None,
         monitor: str | None = None,
     ) -> None:
         """Initialize the KL-regularized Autoencoder.
 
         Args:
-            # ddconfig: Configuration dictionary for encoder/decoder architecture
-            lossconfig: Configuration dictionary for loss function
+            encoder: Encoder module to use for encoding input into latent space
+            decoder: Decoder module to use for decoding latent representation
+            loss_fn: Loss function to use for training
             embed_dim: Dimension of the latent embedding space
             ckpt_path: Path to checkpoint file for loading pretrained weights
             ignore_keys: List of keys to ignore when loading checkpoint
             image_key: Key used to access images in the input batch
+            learning_rate: Learning rate for training
+            rgb_channel_indices: Indices of RGB channels in input images, used for logging
+                samples during training
             colorize_nlabels: Number of labels for colorization feature
             monitor: Metric to monitor during training
-
-        Returns:
-            None
         """
         super().__init__()
         self.image_key = image_key
@@ -65,6 +73,12 @@ class AutoencoderKL(LightningModule):
 
         self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
+        self.rgb_channel_indices = rgb_channel_indices
+        self.learning_rate = learning_rate
+
+        # Important: This property activates manual optimization.
+        self.automatic_optimization = False
+
     def init_from_ckpt(self, path, ignore_keys=list()) -> None:
         """
         Load model weights from a checkpoint file.
@@ -72,9 +86,6 @@ class AutoencoderKL(LightningModule):
         Args:
             path: Path to the checkpoint file containing model weights
             ignore_keys: List of keys to ignore when loading the state dict
-
-        Returns:
-            None
         """
         if path is None:
             path = 'vae-ft-mse-840000-ema-pruned.ckpt'
@@ -92,12 +103,15 @@ class AutoencoderKL(LightningModule):
         self.load_state_dict(sd, strict=False)
         print(f'Restored from {path}')
 
-    def encode(self, x: torch.Tensor, wvs: torch.Tensor) -> DiagonalGaussianDistribution:
+    def encode(
+        self, x: torch.Tensor, wvs: torch.Tensor
+    ) -> DiagonalGaussianDistribution:
         """
         Encode input tensor to latent representation.
 
         Args:
             x: Input tensor to encode [B, C, H, W]
+            wvs: wavelengths values fo channels
 
         Returns:
             Posterior distribution in latent space
@@ -142,25 +156,8 @@ class AutoencoderKL(LightningModule):
         dec = self.decode(z, wvs)
         return dec, posterior
 
-    def get_input(self, batch: dict[str, torch.Tensor], k: str) -> torch.Tensor:
-        """
-        Extract and process input tensor from batch.
-
-        Args:
-            batch: Dictionary containing batch data
-            k: Key to extract from batch
-
-        Returns:
-            Processed input tensor [B, C, H, W]
-        """
-        x = batch[k]
-        if len(x.shape) == 3:
-            x = x[..., None]
-        x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
-        return x
-
     def training_step(
-        self, batch: dict[str, torch.Tensor], batch_idx: int, optimizer_idx: int
+        self, batch: dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
         """
         Training step for autoencoder.
@@ -168,62 +165,77 @@ class AutoencoderKL(LightningModule):
         Args:
             batch: Input batch dictionary
             batch_idx: Index of current batch
-            optimizer_idx: Index of optimizer (0: AE, 1: Discriminator)
 
         Returns:
             Loss value for current step
         """
-        inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
+        # Retrieve optimizers
+        opt_ae, opt_disc = self.optimizers()
 
-        if optimizer_idx == 0:
-            # train encoder+decoder+logvar
-            aeloss, log_dict_ae = self.loss(
-                inputs,
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split='train',
-            )
-            self.log(
-                'aeloss',
-                aeloss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
-            self.log_dict(
-                log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False
-            )
-            return aeloss
+        inputs = batch[self.image_key]
+        wvs = batch['wvs'][0, :]
+        reconstructions, posterior = self(inputs, wvs)
 
-        if optimizer_idx == 1:
-            # train the discriminator
-            discloss, log_dict_disc = self.loss(
-                inputs,
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split='train',
-            )
+        # Compute losses for autoencoder and discriminator
+        aeloss, log_dict_ae = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            wvs=wvs,
+            last_layer=self.get_last_layer(),
+            split='train',
+        )
+        discloss, log_dict_disc = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            wvs=wvs,
+            last_layer=self.get_last_layer(),
+            split='train',
+        )
 
-            self.log(
-                'discloss',
-                discloss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
-            self.log_dict(
-                log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False
-            )
-            return discloss
+        # https://lightning.ai/docs/pytorch/stable/model/manual_optimization.html#gradient-accumulation
+        # Optimize autoencoder
+        opt_ae.zero_grad()
+        self.manual_backward(aeloss)
+        # clip gradients
+        self.clip_gradients(
+            opt_ae, gradient_clip_val=1.0, gradient_clip_algorithm='norm'
+        )
+        opt_ae.step()
+
+        # Optimize discriminator
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        # clip gradients
+        self.clip_gradients(
+            opt_disc, gradient_clip_val=1.0, gradient_clip_algorithm='norm'
+        )
+        opt_disc.step()
+
+        self.log(
+            'aeloss', aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True
+        )
+        self.log_dict(
+            log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False
+        )
+        self.log(
+            'discloss',
+            discloss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+        )
+        self.log_dict(
+            log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False
+        )
+
+        # return aeloss, discloss
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
@@ -238,14 +250,16 @@ class AutoencoderKL(LightningModule):
         Returns:
             Dictionary of logged metrics
         """
-        inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
+        inputs = batch[self.image_key]
+        wvs = batch['wvs'][0, :]
+        reconstructions, posterior = self(inputs, wvs)
         aeloss, log_dict_ae = self.loss(
             inputs,
             reconstructions,
             posterior,
             0,
             self.global_step,
+            wvs=wvs,
             last_layer=self.get_last_layer(),
             split='val',
         )
@@ -256,6 +270,7 @@ class AutoencoderKL(LightningModule):
             posterior,
             1,
             self.global_step,
+            wvs=wvs,
             last_layer=self.get_last_layer(),
             split='val',
         )
@@ -285,6 +300,7 @@ class AutoencoderKL(LightningModule):
             self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
         )
         # TODO learning rate schedulers?
+        # or more control over optimizers?
         return [opt_ae, opt_disc], []
 
     def get_last_layer(self) -> torch.Tensor:
@@ -311,6 +327,7 @@ class AutoencoderKL(LightningModule):
         Returns:
             Dictionary containing input, reconstructed and sampled images
         """
+        # TODO not gonna work for all satellite imagery
         log = dict()
         x = self.get_input(batch, self.image_key)
         x = x.to(self.device)
