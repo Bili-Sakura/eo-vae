@@ -304,7 +304,6 @@ class DynamicConv(nn.Module):
         waves = get_1d_sincos_pos_embed_from_grid_torch(self.wv_planes, wvs * 1000)
         waves = self.fclayer(waves)
         weight, bias = self._get_weights(waves)  # 3x3x3
-
         dynamic_weight = weight.view(
             inplanes, self.kernel_size, self.kernel_size, self.embed_dim
         )

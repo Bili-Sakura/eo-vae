@@ -4,6 +4,7 @@
 
 # Based on code: https://github.com/CompVis/latent-diffusion/blob/main/ldm/modules/encoders/modules.py
 
+import os
 import math
 import pdb
 import torch
@@ -12,6 +13,7 @@ import numpy as np
 from einops import rearrange
 from .modules.dynamic_conv import DynamicConv, DynamicConv_decoder
 from typing import List, Tuple
+from torchvision.datasets.utils import download_url
 
 
 from .modules.layers import (
@@ -25,6 +27,8 @@ from .modules.layers import (
 
 
 class Encoder(nn.Module):
+    init_weight_gen_path = 'https://huggingface.co/nilsleh/eo-vae/main/resolve/encoder_dconv_weight_generator_init_0.01_er50k.pt'
+
     def __init__(
         self,
         *,
@@ -68,10 +72,6 @@ class Encoder(nn.Module):
         self.z_channels = z_channels
 
         # downsampling
-        # self.conv_in = torch.nn.Conv2d(
-        #    in_channels, self.ch, kernel_size=3, stride=1, padding=1
-        # )
-        #'''
         self.conv_in = DynamicConv(
             wv_planes=128,
             inter_dim=128,
@@ -83,12 +83,13 @@ class Encoder(nn.Module):
 
         # TODO: if training
         # TODO need to handle this without fixed paths
-        # wg_weights = torch.load(
-        #     '/home/xshadow/Datasets/eo-vae/src/models/encoder_dconv_weight_generator_init_0.01_er50k.pt'
-        # )
-        # self.conv_in.weight_generator.load_state_dict(wg_weights['weight_generator'])
-        # self.conv_in.fclayer.load_state_dict(wg_weights['fclayer'])
-        #'''
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        path = os.path.join(
+            current_dir, 'encoder_dconv_weight_generator_init_0.01_er50k.pt'
+        )
+        wg_weights = torch.load(path, map_location='cpu')
+        self.conv_in.weight_generator.load_state_dict(wg_weights['weight_generator'])
+        self.conv_in.fclayer.load_state_dict(wg_weights['fclayer'])
 
         curr_res = resolution
         in_ch_mult = (1,) + tuple(ch_mult)
@@ -118,7 +119,6 @@ class Encoder(nn.Module):
                 down.downsample = Downsample(block_in, resamp_with_conv)
                 curr_res = curr_res // 2
             self.down.append(down)
-
         # middle
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(
@@ -151,7 +151,6 @@ class Encoder(nn.Module):
 
         # downsampling
         hs = [self.conv_in(x, wvs)]
-        # hs = [self.conv_in(x)]
 
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -282,9 +281,7 @@ class Decoder(nn.Module):
 
         # end
         self.norm_out = Normalize(block_in)
-        # self.conv_out = torch.nn.Conv2d(
-        #    block_in, out_ch, kernel_size=3, stride=1, padding=1
-        # )
+
         self.conv_out = DynamicConv_decoder(
             wv_planes=128,
             inter_dim=128,
@@ -295,11 +292,14 @@ class Decoder(nn.Module):
         )
         # TODO
         # need to handle this without fixed paths
-        # wg_weights = torch.load(
-        #     '/home/xshadow/Datasets/eo-vae/src/models/decoder_dconv_weight_generator_init_0.01_er50k.pt'
-        # )
-        # self.conv_out.weight_generator.load_state_dict(wg_weights['weight_generator'])
-        # self.conv_out.fclayer.load_state_dict(wg_weights['fclayer'])
+
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        path = os.path.join(
+            current_dir, 'decoder_dconv_weight_generator_init_0.01_er50k.pt'
+        )
+        wg_weights = torch.load(path, map_location='cpu')
+        self.conv_out.weight_generator.load_state_dict(wg_weights['weight_generator'])
+        self.conv_out.fclayer.load_state_dict(wg_weights['fclayer'])
 
     def forward(self, z, wvs):
         # assert z.shape[1:] == self.z_shape[1:]

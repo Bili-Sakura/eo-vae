@@ -6,6 +6,7 @@
 # - Adopted to support newer torch/lightning versions
 # - added docstrings and type annotations
 # - adopted for anysensor inputs
+# - manual optimization according to newer lightning version
 
 
 import torch
@@ -33,6 +34,8 @@ class AutoencoderKL(LightningModule):
         ckpt_path: str | None = None,
         ignore_keys: list[str] = [],
         image_key: str = 'image',
+        learning_rate: float = 1e-5,
+        rgb_channel_indices: list[int] = [0, 1, 2],
         colorize_nlabels: int | None = None,
         monitor: str | None = None,
     ) -> None:
@@ -46,6 +49,9 @@ class AutoencoderKL(LightningModule):
             ckpt_path: Path to checkpoint file for loading pretrained weights
             ignore_keys: List of keys to ignore when loading checkpoint
             image_key: Key used to access images in the input batch
+            learning_rate: Learning rate for training
+            rgb_channel_indices: Indices of RGB channels in input images, used for logging
+                samples during training
             colorize_nlabels: Number of labels for colorization feature
             monitor: Metric to monitor during training
         """
@@ -66,6 +72,12 @@ class AutoencoderKL(LightningModule):
             self.monitor = monitor
 
         self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+        self.rgb_channel_indices = rgb_channel_indices
+        self.learning_rate = learning_rate
+
+        # Important: This property activates manual optimization.
+        self.automatic_optimization = False
 
     def init_from_ckpt(self, path, ignore_keys=list()) -> None:
         """
@@ -145,7 +157,7 @@ class AutoencoderKL(LightningModule):
         return dec, posterior
 
     def training_step(
-        self, batch: dict[str, torch.Tensor], batch_idx: int, optimizer_idx: int
+        self, batch: dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
         """
         Training step for autoencoder.
@@ -153,65 +165,77 @@ class AutoencoderKL(LightningModule):
         Args:
             batch: Input batch dictionary
             batch_idx: Index of current batch
-            optimizer_idx: Index of optimizer (0: AE, 1: Discriminator)
 
         Returns:
             Loss value for current step
         """
+        # Retrieve optimizers
+        opt_ae, opt_disc = self.optimizers()
+
         inputs = batch[self.image_key]
-        wvs = batch['wvs']
+        wvs = batch['wvs'][0, :]
         reconstructions, posterior = self(inputs, wvs)
 
-        if optimizer_idx == 0:
-            # train encoder+decoder+logvar
-            aeloss, log_dict_ae = self.loss(
-                inputs,
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                wvs=wvs,
-                last_layer=self.get_last_layer(),
-                split='train',
-            )
-            self.log(
-                'aeloss',
-                aeloss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
-            self.log_dict(
-                log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False
-            )
-            return aeloss
+        # Compute losses for autoencoder and discriminator
+        aeloss, log_dict_ae = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            wvs=wvs,
+            last_layer=self.get_last_layer(),
+            split='train',
+        )
+        discloss, log_dict_disc = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            wvs=wvs,
+            last_layer=self.get_last_layer(),
+            split='train',
+        )
 
-        if optimizer_idx == 1:
-            # train the discriminator
-            discloss, log_dict_disc = self.loss(
-                inputs,
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                wvs=wvs,
-                last_layer=self.get_last_layer(),
-                split='train',
-            )
+        # https://lightning.ai/docs/pytorch/stable/model/manual_optimization.html#gradient-accumulation
+        # Optimize autoencoder
+        opt_ae.zero_grad()
+        self.manual_backward(aeloss)
+        # clip gradients
+        self.clip_gradients(
+            opt_ae, gradient_clip_val=1.0, gradient_clip_algorithm='norm'
+        )
+        opt_ae.step()
 
-            self.log(
-                'discloss',
-                discloss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
-            self.log_dict(
-                log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False
-            )
-            return discloss
+        # Optimize discriminator
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        # clip gradients
+        self.clip_gradients(
+            opt_disc, gradient_clip_val=1.0, gradient_clip_algorithm='norm'
+        )
+        opt_disc.step()
+
+        self.log(
+            'aeloss', aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True
+        )
+        self.log_dict(
+            log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False
+        )
+        self.log(
+            'discloss',
+            discloss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+        )
+        self.log_dict(
+            log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False
+        )
+
+        # return aeloss, discloss
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
@@ -227,13 +251,15 @@ class AutoencoderKL(LightningModule):
             Dictionary of logged metrics
         """
         inputs = batch[self.image_key]
-        reconstructions, posterior = self(inputs, batch['wvs'])
+        wvs = batch['wvs'][0, :]
+        reconstructions, posterior = self(inputs, wvs)
         aeloss, log_dict_ae = self.loss(
             inputs,
             reconstructions,
             posterior,
             0,
             self.global_step,
+            wvs=wvs,
             last_layer=self.get_last_layer(),
             split='val',
         )
@@ -244,6 +270,7 @@ class AutoencoderKL(LightningModule):
             posterior,
             1,
             self.global_step,
+            wvs=wvs,
             last_layer=self.get_last_layer(),
             split='val',
         )
@@ -273,6 +300,7 @@ class AutoencoderKL(LightningModule):
             self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
         )
         # TODO learning rate schedulers?
+        # or more control over optimizers?
         return [opt_ae, opt_disc], []
 
     def get_last_layer(self) -> torch.Tensor:

@@ -11,6 +11,7 @@ from hydra.utils import instantiate
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from omegaconf import OmegaConf
+from eo_vae.utils.callbacks import ImageLogger
 
 
 def create_experiment_dir(config: dict[str, Any]) -> str:
@@ -25,7 +26,6 @@ def create_experiment_dir(config: dict[str, Any]) -> str:
     os.makedirs(config['experiment']['exp_dir'], exist_ok=True)
     exp_dir_name = (
         f'{config["experiment"]["experiment_name"]}'
-        f'_{config["seg_method"]["_target_"].split(".")[-1]}'
         f'_{datetime.now().strftime("%m-%d-%Y_%H-%M-%S-%f")}'
     )
     config['experiment']['experiment_name'] = exp_dir_name
@@ -43,12 +43,12 @@ def run_experiment(config) -> None:
         config: config file
     """
     torch.set_float32_matmul_precision('medium')
-    model = instantiate(config.seg_method)
+    model = instantiate(config.model)
 
     datamodule = instantiate(config.datamodule)
 
     loggers = [
-        CSVLogger(config['experiment']['save_dir'], name='csv_logs'),
+        # CSVLogger(config['experiment']['save_dir'], name='csv_logs'),
         WandbLogger(
             name=config['experiment']['experiment_name'],
             save_dir=config['experiment']['save_dir'],
@@ -56,10 +56,10 @@ def run_experiment(config) -> None:
             entity=config['wandb']['entity'],
             resume='allow',
             mode=config['wandb']['mode'],
-        ),
+        )
     ]
 
-    track_metric = 'val_loss'
+    track_metric = 'val/rec_loss'
     mode = 'min'
 
     checkpoint_callback = ModelCheckpoint(
@@ -70,6 +70,8 @@ def run_experiment(config) -> None:
         save_last=True,
         every_n_epochs=1,
     )
+
+    image_logger = ImageLogger(rgb_indices=[0, 1, 2], num_images=4)
 
     trainer = instantiate(
         config.trainer, callbacks=[checkpoint_callback], logger=loggers
