@@ -29,6 +29,9 @@ class SeasoNetWithWaves(SeasoNet):
         """Return the image and waves at the given index."""
         sample = super().__getitem__(index)
         sample['wvs'] = self.wvs.float()
+        # import pdb
+        # pdb.set_trace()
+        sample["image"] = sample["image"] / 3000
         return sample
 
 
@@ -86,9 +89,9 @@ class SeasoNetDataModule(NonGeoDataModule):
         else:
             self.mean, self.std = self.means[:], self.stds[:]
 
-        kwargs['transforms'] = K.AugmentationSequential(
-            K.Normalize(mean=self.mean, std=self.std), data_keys=None, keepdim=True
-        )
+        # kwargs['transforms'] = K.AugmentationSequential(
+        #     K.Normalize(mean=self.mean, std=self.std), data_keys=None, keepdim=True
+        # )
         # add normalization to dataset level
         super().__init__(SeasoNetWithWaves, batch_size, num_workers, **kwargs)
 

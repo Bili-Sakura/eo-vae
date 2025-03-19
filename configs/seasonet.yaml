@@ -46,7 +46,8 @@ model:
 
 datamodule:
   _target_: datamodule.SeasoNetDataModule
-  root: "/mnt/data/datasets_segmentation/SeasoNet"
+  root: "/mnt/rg_climate_benchmark/data/datasets_segmentation/SeasoNet"
+  bands: ['10m_RGB']
   batch_size: 8
   num_workers: 4
   seasons: ["Spring", "Summer", "Fall", "Winter"]
