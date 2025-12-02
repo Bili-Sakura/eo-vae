@@ -11,6 +11,8 @@ from omegaconf import OmegaConf
 
 from eo_vae.datasets.terramesh_datamodule import NORM_STATS
 
+OmegaConf.register_new_resolver('eval', eval)
+
 
 def load_config(config_path: str):
     """Load YAML configuration from a given path."""
@@ -140,11 +142,18 @@ def main():
         help='Path to the trained model checkpoint file.',
     )
     parser.add_argument(
-        '--norm-mode',
+        '--trained-norm-mode',
         type=str,
         choices=['zscore', '01'],
         default='zscore',
-        help='Normalization mode: zscore or 01.',
+        help='Normalization mode for trained model input: zscore or 01.',
+    )
+    parser.add_argument(
+        '--original-norm-mode',
+        type=str,
+        choices=['zscore', '01'],
+        default='zscore',
+        help='Normalization mode for original model input: zscore or 01.',
     )
     parser.add_argument(
         '--num-samples',
@@ -159,9 +168,11 @@ def main():
 
     # Load the trained checkpoint
     checkpoint = torch.load(args.ckpt, map_location='cpu')
-    trained_model.load_state_dict(
-        checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+    unexpected, missing = trained_model.load_state_dict(
+        checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint,
+        strict=True,
     )
+    trained_model.eval()
 
     # Load the original FLUX2 autoencoder from Hugging Face
     flux2_vae = AutoencoderKL.from_pretrained(
@@ -175,7 +186,8 @@ def main():
 
     # Select the first num_samples
     input_selected = input_batch[:num_samples]
-    input_for_model = unnormalize_for_input(input_selected, args.norm_mode)
+    input_for_trained = unnormalize_for_input(input_selected, args.trained_norm_mode)
+    input_for_original = unnormalize_for_input(input_selected, args.original_norm_mode)
     input_unnorm_selected = unnormalize_for_plotting(
         input_selected, 'zscore'
     )  # Always unnormalize originals for plotting
@@ -183,15 +195,15 @@ def main():
     wvs_batch = torch.tensor([0.665, 0.560, 0.490])
 
     # Reconstruct with trained model (batch processing)
-    trained_recon_selected = forward_pass(trained_model, input_for_model, wvs_batch)
+    trained_recon_selected = forward_pass(trained_model, input_for_trained, wvs_batch)
     trained_recon_for_plot = unnormalize_for_plotting(
-        trained_recon_selected, args.norm_mode
+        trained_recon_selected, args.trained_norm_mode
     )
 
     # Reconstruct with original model (batch processing)
-    original_recon_selected = forward_pass(flux2_vae, input_for_model)
+    original_recon_selected = forward_pass(flux2_vae, input_for_original)
     original_recon_for_plot = unnormalize_for_plotting(
-        original_recon_selected, args.norm_mode
+        original_recon_selected, args.original_norm_mode
     )
 
     # Create lists for plotting

@@ -2,6 +2,7 @@ import torch
 import torch.fft
 import torch.nn as nn
 import torch.nn.functional as F
+from focal_frequency_loss import FocalFrequencyLoss as FFL
 
 
 class SpectralAngleMapperLoss(nn.Module):
@@ -14,24 +15,23 @@ class SpectralAngleMapperLoss(nn.Module):
         self.eps = eps
 
     def forward(self, x_rec, x_true):
-        # Permute to [B, H, W, C] for channel-wise angle computation
+        # Manual calculation of norms with epsilon for gradient stability at 0
+        # torch.norm() has undefined gradients at 0, which is common in Z-score normalized data
+        norm_rec = torch.sqrt(torch.sum(x_rec**2, dim=1) + self.eps)
+        norm_true = torch.sqrt(torch.sum(x_true**2, dim=1) + self.eps)
+
         # Dot product along channels
         dot = torch.sum(x_rec * x_true, dim=1)
 
-        # Norms for each pixel
-        norm_rec = torch.norm(x_rec, dim=1)
-        norm_true = torch.norm(x_true, dim=1)
-
         # Cosine similarity
-        cos_sim = dot / (norm_rec * norm_true + self.eps)
+        cos_sim = dot / (norm_rec * norm_true)
 
         # Clamp to avoid acos issues
         cos_sim = torch.clamp(cos_sim, -1 + self.eps, 1 - self.eps)
 
         # Spectral Angle in radians
         sam = torch.acos(cos_sim)
-
-        return sam.mean()
+        return torch.mean(sam)
 
 
 class SpatialGradientLoss(nn.Module):
@@ -53,8 +53,8 @@ class SpatialGradientLoss(nn.Module):
         b, c, h, w = x_rec.shape
 
         # Flatten channels for group conv
-        x_rec_flat = x_rec.view(-1, 1, h, w)
-        x_true_flat = x_true.view(-1, 1, h, w)
+        x_rec_flat = x_rec.reshape(-1, 1, h, w)
+        x_true_flat = x_true.reshape(-1, 1, h, w)
 
         grad_x_rec = F.conv2d(x_rec_flat, self.kernel_x, padding=1)
         grad_y_rec = F.conv2d(x_rec_flat, self.kernel_y, padding=1)
@@ -66,29 +66,29 @@ class SpatialGradientLoss(nn.Module):
         return loss
 
 
-class FocalFrequencyLoss(nn.Module):
-    """FFT loss that focuses on frequencies the model struggles with."""
+class DOFASemanticLoss(nn.Module):
+    """Computes semantic feature loss using DOFA features."""
 
-    def __init__(self, loss_weight=1.0, alpha=1.0):
+    def __init__(self, dofa_net: nn.Module):
         super().__init__()
-        self.loss_weight = loss_weight
-        self.alpha = alpha
+        self.dofa_net = dofa_net
+        # Freeze DOFA
+        for p in self.dofa_net.parameters():
+            p.requires_grad = False
 
-    def forward(self, x_rec, x_true):
-        fft_rec = torch.fft.fft2(x_rec, norm='ortho')
-        fft_true = torch.fft.fft2(x_true, norm='ortho')
+    def forward(
+        self, inputs: torch.Tensor, reconstructions: torch.Tensor, wvs: torch.Tensor
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            f_in = self.dofa_net.forward_features(inputs, wvs)
+        # Allow gradients to flow to reconstructions
+        f_rec = self.dofa_net.forward_features(reconstructions, wvs)
 
-        rec_stack = torch.stack([fft_rec.real, fft_rec.imag], dim=-1)
-        true_stack = torch.stack([fft_true.real, fft_true.imag], dim=-1)
+        l_feat = 0.0
+        for fi, fr in zip(f_in, f_rec):
+            l_feat += (1.0 - F.cosine_similarity(fi, fr, dim=1)).mean()
 
-        diff = rec_stack - true_stack
-
-        # Weight based on error magnitude
-        tmp = (diff**2).sum(dim=-1, keepdim=True)
-        weight = tmp ** (self.alpha / 2)
-
-        loss = (weight * tmp).mean()
-        return self.loss_weight * loss
+        return l_feat
 
 
 class EOConsistencyLoss(nn.Module):
@@ -99,9 +99,35 @@ class EOConsistencyLoss(nn.Module):
         spatial_weight: float = 0.5,  # Gradient for edges
         freq_weight: float = 0.1,  # FFT for textures
         feature_weight: float = 0.0,  # Optional DOFA features
+        spectral_start_step: int = 1000,
+        spatial_start_step: int = 2000,
+        freq_start_step: int = 5000,
+        feature_start_step: int = 5000,
         dofa_net: nn.Module = None,
     ):
+        """Initializes the EO Consistency Loss with multiple components.
+
+        Args:
+            pixel_weight: Weight for pixel-wise L1 loss.
+            spectral_weight: Weight for spectral angle mapper loss, useful for multispectral data.
+            spatial_weight: Weight for spatial gradient loss to preserve edges.
+            freq_weight: Weight for focal frequency loss to capture textures.
+            feature_weight: Weight for semantic feature loss using a pretrained DOFA network.
+            spectral_start_step: Global step to start applying spectral loss.
+            spatial_start_step: Global step to start applying spatial loss.
+            freq_start_step: Global step to start applying frequency loss.
+            feature_start_step: Global step to start applying feature loss.
+            dofa_net: Pretrained DOFA network for feature extraction (if feature_weight > 0).
+
+        """
         super().__init__()
+
+        self.starts = {
+            'spectral': spectral_start_step,
+            'spatial': spatial_start_step,
+            'freq': freq_start_step,
+            'feature': feature_start_step,
+        }
         self.weights = {
             'pixel': pixel_weight,
             'spectral': spectral_weight,
@@ -112,56 +138,65 @@ class EOConsistencyLoss(nn.Module):
 
         self.sam_loss = SpectralAngleMapperLoss()
         self.grad_loss = SpatialGradientLoss()
-        self.fft_loss = FocalFrequencyLoss()
-
-        self.dofa_net = dofa_net
-        if self.dofa_net:
-            for p in self.dofa_net.parameters():
-                p.requires_grad = False
+        self.fft_loss = FFL(loss_weight=1.0, alpha=1.0)
+        self.feature_loss = DOFASemanticLoss(dofa_net) if dofa_net is not None else None
 
     def forward(
         self,
         inputs: torch.Tensor,
-        reconstructions: torch.Tensor,
         wvs: torch.Tensor,
+        reconstructions: torch.Tensor,
+        global_step: int = 0,
+        split: str = 'train',
         **kwargs,
     ):
         logs = {}
-        total_loss = 0.0
+        # Initialize as tensor to ensure device consistency
+        total_loss = torch.tensor(0.0, device=inputs.device)
 
+        # 1. Pixel Loss (Always Active)
         if self.weights['pixel'] > 0:
             l_pix = F.l1_loss(reconstructions, inputs)
-            total_loss += self.weights['pixel'] * l_pix
-            logs['loss/pixel'] = l_pix.detach()
+            total_loss = total_loss + self.weights['pixel'] * l_pix
+            logs[f'{split}/loss_rec'] = l_pix.detach()
 
+        # 2. Spectral Loss (Scheduled)
         if self.weights['spectral'] > 0:
-            l_sam = self.sam_loss(reconstructions, inputs)
-            total_loss += self.weights['spectral'] * l_sam
-            logs['loss/spectral'] = l_sam.detach()
+            if global_step >= self.starts['spectral']:
+                l_sam = self.sam_loss(reconstructions, inputs)
+                total_loss = total_loss + self.weights['spectral'] * l_sam
+                logs[f'{split}/loss_spectral'] = l_sam.detach()
+            else:
+                # Log 0.0 so charts don't break during warm-up
+                logs[f'{split}/loss_spectral'] = torch.tensor(0.0, device=inputs.device)
 
+        # 3. Spatial Loss (Scheduled)
         if self.weights['spatial'] > 0:
-            l_spat = self.grad_loss(reconstructions, inputs)
-            total_loss += self.weights['spatial'] * l_spat
-            logs['loss/spatial'] = l_spat.detach()
+            if global_step >= self.starts['spatial']:
+                l_spat = self.grad_loss(reconstructions, inputs)
+                total_loss = total_loss + self.weights['spatial'] * l_spat
+                logs[f'{split}/loss_spatial'] = l_spat.detach()
+            else:
+                logs[f'{split}/loss_spatial'] = torch.tensor(0.0, device=inputs.device)
 
+        # 4. Frequency Loss (Scheduled)
         if self.weights['freq'] > 0:
-            l_freq = self.fft_loss(reconstructions, inputs)
-            total_loss += self.weights['freq'] * l_freq
-            logs['loss/freq'] = l_freq.detach()
+            if global_step >= self.starts['freq']:
+                l_freq = self.fft_loss(reconstructions, inputs)
+                total_loss = total_loss + self.weights['freq'] * l_freq
+                logs[f'{split}/loss_freq'] = l_freq.detach()
+            else:
+                logs[f'{split}/loss_freq'] = torch.tensor(0.0, device=inputs.device)
 
-        if self.weights['feature'] > 0 and self.dofa_net is not None:
-            with torch.no_grad():
-                f_in = self.dofa_net.extract_features(inputs, wvs)
-                f_rec = self.dofa_net.extract_features(reconstructions, wvs)
+        # 5. Semantic Feature Loss (Scheduled + Requires Net)
+        if self.weights['feature'] > 0:
+            if global_step >= self.starts['feature']:
+                l_feat = self.feature_loss(inputs, reconstructions, wvs)
+                total_loss += self.weights['feature'] * l_feat
+                logs[f'{split}/loss_feature'] = l_feat.detach()
+            else:
+                logs[f'{split}/loss_feature'] = torch.tensor(0.0, device=inputs.device)
 
-            l_feat = 0.0
-            for fi, fr in zip(f_in, f_rec):
-                l_feat += (1.0 - F.cosine_similarity(fi, fr, dim=1)).mean()
+        logs[f'{split}/loss_total'] = total_loss.detach()
 
-            total_loss += self.weights['feature'] * l_feat
-            logs['loss/feature'] = l_feat.detach()
-
-        logs['loss/total'] = total_loss.detach()
-
-        # Return loss and logs
         return total_loss, logs

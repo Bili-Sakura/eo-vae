@@ -1,3 +1,4 @@
+from .consistency_loss import EOConsistencyLoss
 from .distributions import DiagonalGaussianDistribution
 from .loss_functions import EOGenerativeLoss
 from .loss_utils import DOFALPIPS, DOFADiscriminator
@@ -7,4 +8,5 @@ all = (
     'DOFADiscriminator',
     'DOFALPIPS',
     'DiagonalGaussianDistribution',
+    'EOConsistencyLoss',
 )

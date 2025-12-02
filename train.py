@@ -11,7 +11,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from omegaconf import OmegaConf
 
-# from eo_vae.utils.callbacks import ImageLogger # Uncomment if available
+from eo_vae.utils.image_logger import ImageLogger  # Uncomment if available
 
 OmegaConf.register_new_resolver('eval', eval)
 
@@ -58,21 +58,17 @@ def create_experiment_dir(config: dict[str, Any]) -> str:
     return config
 
 
-def run_experiment(config) -> None:
+def run_experiment(config, distilled_ckpt, debug: bool = False) -> None:
     torch.set_float32_matmul_precision('medium')
 
     # 1. Instantiate Model (Random Init or Standard Init)
     print('Instantiating Model Architecture...')
     model = instantiate(config.model)
 
-    # 2. [NEW] Load Distilled Checkpoint if provided
-    # You can add a field 'distilled_ckpt' to your config file
-    distilled_path = config.get('distilled_ckpt', None)
-
-    if distilled_path:
+    if distilled_ckpt is not None:
         # Force mode to finetune just in case config had it set to distill
         model.training_mode = 'finetune'
-        load_distilled_weights(model, distilled_path)
+        load_distilled_weights(model, distilled_ckpt)
     else:
         print(
             'No distilled checkpoint provided. Starting from scratch/random initialization.'
@@ -81,35 +77,44 @@ def run_experiment(config) -> None:
     # 3. Instantiate Data
     datamodule = instantiate(config.datamodule)
 
-    loggers = [
-        CSVLogger(save_dir=config['experiment']['save_dir']),
-        WandbLogger(
-            name=config['experiment']['experiment_name'],
-            save_dir=config['experiment']['save_dir'],
-            project=config['wandb']['project'],
-            entity=config['wandb']['entity'],
-            resume='allow',
-            mode=config['wandb']['mode'],
-        ),
-    ]
+    if debug:
+        loggers = []
+        checkpoint_callback = None
+    else:
+        loggers = [
+            CSVLogger(save_dir=config['experiment']['save_dir']),
+            WandbLogger(
+                name=config['experiment']['experiment_name'],
+                save_dir=config['experiment']['save_dir'],
+                project=config['wandb']['project'],
+                entity=config['wandb']['entity'],
+                resume='allow',
+                mode=config['wandb']['mode'],
+            ),
+        ]
 
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=config['experiment']['save_dir'],
-        save_top_k=1,
-        monitor='val/loss_total',
-        mode='min',
-        save_last=True,
-        every_n_epochs=1,
-    )
+        img_logger = ImageLogger(
+            max_images=8, save_dir=config['experiment']['save_dir']
+        )
 
-    # image_logger = ImageLogger(rgb_indices=[0, 1, 2], num_images=4)
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=config['experiment']['save_dir'],
+            save_top_k=1,
+            monitor='val/loss_rec',
+            mode='min',
+            save_last=True,
+            every_n_epochs=1,
+        )
 
-    trainer = instantiate(
-        config.trainer, callbacks=[checkpoint_callback], logger=loggers
-    )
+    callbacks = [checkpoint_callback, img_logger] if checkpoint_callback else []
 
-    with open(os.path.join(config['experiment']['save_dir'], 'config.yaml'), 'w') as f:
-        OmegaConf.save(config=config, f=f)
+    trainer = instantiate(config.trainer, callbacks=callbacks, logger=loggers)
+
+    if not debug:
+        with open(
+            os.path.join(config['experiment']['save_dir'], 'config.yaml'), 'w'
+        ) as f:
+            OmegaConf.save(config=config, f=f)
 
     trainer.fit(model, datamodule=datamodule)
 
@@ -125,10 +130,18 @@ if __name__ == '__main__':
         '--distilled-ckpt', type=str, default=None, help='Path to distilled checkpoint'
     )
 
+    # Add debug flag
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Run in debug mode: no logging, no experiment directory',
+    )
+
     args = parser.parse_args()
 
     config = OmegaConf.load(args.config)
 
-    config = create_experiment_dir(config)
+    if not args.debug:
+        config = create_experiment_dir(config)
 
-    run_experiment(config)
+    run_experiment(config, args.distilled_ckpt, debug=args.debug)

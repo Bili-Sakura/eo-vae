@@ -33,7 +33,6 @@ def get_cosine_schedule_with_warmup(
     Returns:
         LambdaLR scheduler
     """
-    import math
 
     def lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
@@ -150,13 +149,17 @@ class FluxAutoencoderKL(LightningModule):
         # 3. Filter Keys (Remove static layers if dynamic, remove ignore_keys)
         keys = list(sd.keys())
         for k in keys:
-            # Skip static input/output weights if using dynamic ops
+            # Skip static input/output weights ONLY if they look like static weights
+            # (i.e. they are NOT part of the new dynamic sub-modules)
             if self.encoder.use_dynamic_ops and 'encoder.conv_in' in k:
-                del sd[k]
-                continue
+                if 'weight_generator' not in k and 'fclayer' not in k:
+                    del sd[k]
+                    continue
+
             if self.decoder.use_dynamic_ops and 'decoder.conv_out' in k:
-                del sd[k]
-                continue
+                if 'weight_generator' not in k and 'fclayer' not in k:
+                    del sd[k]
+                    continue
 
             # User-specified ignore keys
             for ik in ignore_keys:
@@ -268,10 +271,18 @@ class FluxAutoencoderKL(LightningModule):
                 p for p in self.decoder.parameters() if p.requires_grad
             ]
 
-            disc_params = self.loss_fn.discriminator.parameters()
-
             opt_ae = torch.optim.Adam(ae_params, lr=self.base_lr, betas=(0.5, 0.9))
-            opt_disc = torch.optim.Adam(disc_params, lr=self.base_lr, betas=(0.5, 0.9))
+
+            optimizers = [opt_ae]
+            scheduler_list = []
+
+            # Check if loss_fn has discriminator
+            if hasattr(self.loss_fn, 'discriminator'):
+                disc_params = self.loss_fn.discriminator.parameters()
+                opt_disc = torch.optim.Adam(
+                    disc_params, lr=self.base_lr, betas=(0.5, 0.9)
+                )
+                optimizers.append(opt_disc)
 
             # Build schedulers
             if (
@@ -291,21 +302,22 @@ class FluxAutoencoderKL(LightningModule):
                     base_lr=self.base_lr,
                     final_lr=self.final_lr_sched,
                 )
-                sch_disc = get_cosine_schedule_with_warmup(
-                    opt_disc,
-                    num_warmup_steps=num_warmup_steps,
-                    num_training_steps=num_training_steps,
-                    base_lr=self.base_lr,
-                    final_lr=self.final_lr_sched,
-                )
-                scheduler_list = [
-                    {'scheduler': sch_ae, 'interval': 'step'},
-                    {'scheduler': sch_disc, 'interval': 'step'},
-                ]
+                scheduler_list.append({'scheduler': sch_ae, 'interval': 'step'})
 
-                return [opt_ae, opt_disc], scheduler_list
+                if len(optimizers) > 1:  # Has disc
+                    sch_disc = get_cosine_schedule_with_warmup(
+                        opt_disc,
+                        num_warmup_steps=num_warmup_steps,
+                        num_training_steps=num_training_steps,
+                        base_lr=self.base_lr,
+                        final_lr=self.final_lr_sched,
+                    )
+                    scheduler_list.append({'scheduler': sch_disc, 'interval': 'step'})
+
+            if len(scheduler_list) > 0:
+                return optimizers, scheduler_list
             else:
-                return [opt_ae, opt_disc]
+                return optimizers
 
     # =========================================================
     #  FORWARD PASS (Encode -> Shuffle -> Decode)
@@ -419,31 +431,30 @@ class FluxAutoencoderKL(LightningModule):
     # =========================================================
     #  MODE B: FINETUNING
     # =========================================================
-
     def _training_step_finetune(self, batch):
-        opt_ae, opt_disc = self.optimizers()
+        opts = self.optimizers()
+        if isinstance(opts, list):
+            opt_gen = opts[0]
+            opt_disc = opts[1] if len(opts) > 1 else None
+        else:
+            opt_gen = opts
+            opt_disc = None
+
+        schs = self.lr_schedulers()
+        if isinstance(schs, list):
+            sch_gen = schs[0] if schs else None
+            sch_disc = schs[1] if len(schs) > 1 else None
+        else:
+            sch_gen = schs
+            sch_disc = None
+
         images = self.get_input(batch, self.image_key)
         wvs = batch['wvs']
 
-        opts = self.optimizers()
-        opt_gen = opts[0]
-        opt_disc = opts[-1]  # Discriminator is always last
-        if len(opts) > 2:
-            opt_enc = opts[1]  # Encoder optimizer if tuning
-        else:
-            opt_enc = None
-
-        schs = self.lr_schedulers()
-        sch_gen = schs[0] if schs else None
-        sch_disc = schs[-1] if schs else None
-        if len(schs) > 2:
-            sch_enc = schs[1]
-        else:
-            sch_enc = None
-
         # Determine if discriminator should be trained
         train_disc = (
-            self.global_step >= self.loss_fn.disc_update_start_step
+            opt_disc is not None
+            and self.global_step >= self.loss_fn.disc_update_start_step
             and self.loss_fn.disc_weight > 0.0
         )
 
@@ -451,12 +462,10 @@ class FluxAutoencoderKL(LightningModule):
         # Generator Training
         # =====================
         opt_gen.zero_grad()
-        if hasattr(self.loss_fn, 'discriminator'):
+        if opt_disc is not None and hasattr(self.loss_fn, 'discriminator'):
             self.loss_fn.discriminator.eval()
 
         # Forward pass: encode and decode
-        # z = self.encode(images, **encoder_kwargs)
-        # recon = self.decode(z, wvs, use_ema=False)
         recon, _ = self.forward(images, wvs)
 
         # Compute generator loss
@@ -482,9 +491,6 @@ class FluxAutoencoderKL(LightningModule):
         opt_gen.step()
         if sch_gen is not None:
             sch_gen.step()
-
-        # Update EMA
-        # self.update_ema()
 
         # =====================
         # Discriminator Training
@@ -519,19 +525,13 @@ class FluxAutoencoderKL(LightningModule):
 
             if hasattr(self.loss_fn, 'discriminator'):
                 self.loss_fn.discriminator.eval()
-        else:
-            # Create dummy log dict
-            log_dict_disc = {
-                'train/loss_disc': torch.tensor(0.0, device=images.device),
-                'train/logits_real': torch.tensor(0.0, device=images.device),
-                'train/logits_fake': torch.tensor(0.0, device=images.device),
-            }
 
         # Logging
-        log_dict = {**log_dict_gen, **log_dict_disc}
+        log_dict = {**log_dict_gen}
         log_dict['train/lr_gen'] = opt_gen.param_groups[0]['lr']
         if train_disc:
             log_dict['train/lr_disc'] = opt_disc.param_groups[0]['lr']
+            log_dict.update(log_dict_disc)
 
         self.log_dict(
             log_dict,

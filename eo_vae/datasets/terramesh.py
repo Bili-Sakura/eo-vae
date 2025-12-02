@@ -171,7 +171,8 @@ def build_terramesh_dataset(
         modalities = modalities[0]
 
     # No shuffle and partial load for val
-    shuffle = shuffle if shuffle is not None else split != 'val'
+    # shuffle = shuffle if shuffle is not None else split != 'val'
+    shuffle = shuffle
     partial = partial if partial is not None else split == 'val'
     shardshuffle = shardshuffle * shuffle
 
@@ -184,6 +185,7 @@ def build_terramesh_dataset(
             urls=urls,
             batch_size=batch_size,
             transform=transform,
+            shuffle=shuffle,
             return_metadata=return_metadata,
             shardshuffle=shardshuffle,
             deterministic=deterministic,
@@ -300,6 +302,7 @@ def build_wds_dataset(
     empty_check: bool = False,
     time_dim: bool = False,
     partial: bool = False,
+    shuffle: bool = False,
     *args,
     **kwargs,
 ):
@@ -348,6 +351,10 @@ def build_wds_dataset(
 
     if transform is not None:
         dataset = dataset.map(transform)
+
+    # Add sample-level shuffling if shuffle is True
+    if shuffle:
+        dataset = dataset.shuffle(1000, seed=seed)
 
     # Create batches
     if batch_size is not None:

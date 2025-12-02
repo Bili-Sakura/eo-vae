@@ -196,7 +196,7 @@ def single_modality_collate_fn(modalities, normalize=True, target_size=(224, 224
         return {
             'image': images,
             'wvs': wvs,
-            # "modality": selected_modality,  # Optional: track which modality was used
+            'modality': selected_modality,  # Optional: track which modality was used
         }
 
     return collate
@@ -238,11 +238,7 @@ def deterministic_modality_collate_fn(modality, normalize=True, target_size=(224
 
         wvs = torch.FloatTensor(WAVELENGTHS[modality])
 
-        return {
-            'image': images,
-            'wvs': wvs,
-            # "modality": modality,
-        }
+        return {'image': images, 'wvs': wvs, 'modality': modality}
 
     return collate
 
@@ -292,6 +288,9 @@ class TerraMeshDataModule(LightningDataModule):
         self.target_size = target_size
         self.kwargs = kwargs
 
+        # Make norm_stats accessible
+        self.norm_stats = NORM_STATS
+
         # Validate modalities have wavelength definitions
         for mod in modalities:
             if mod not in WAVELENGTHS:
@@ -322,6 +321,7 @@ class TerraMeshDataModule(LightningDataModule):
             modalities=self.modalities,
             split='val',
             batch_size=self.batch_size,
+            shuffle=True,
             **self.kwargs,
         )
         self.val_dataset = build_terramesh_dataset(
@@ -329,6 +329,7 @@ class TerraMeshDataModule(LightningDataModule):
             modalities=self.modalities,
             split='val',
             batch_size=self.eval_batch_size,
+            shuffle=False,
             **self.kwargs,
         )
 
