@@ -1,6 +1,6 @@
 
 experiment:
-  experiment_name: "eo-vae-consistency"
+  experiment_name: "eo-vae-eq"
   exp_dir: "results/exps/eo-vae/finetune"
 
 wandb:
@@ -19,23 +19,28 @@ model:
   decay_end_epoch: ${trainer.max_epochs}
   clip_grad: 1.0
 
+  # eq vae
+  p_prior: 0.5
+  p_prior_s: 0.25
+  anisotropic: False
+
   # Loss configuration
   loss_fn:
-    # _target_: eo_vae.models.modules.consistency_loss.EOConsistencyLoss
-    # rec_loss_type: "char"
-    # pixel_weight: 1.0
-    # msssim_weight: 1.0
-    # spatial_weight: 0.0
-    # freq_weight: 0.0
-    # spectral_weight: 0.0
-    # feature_weight: 0.0
-    # msssim_start_step: 2000
-    _target_: eo_vae.models.modules.consistency_loss.EOPatchLoss
-    disc_start: 4000
-    disc_weight: 0.5
-    ssim_weight: 0.2
-    discriminator:
-      _target_: eo_vae.models.modules.consistency_loss.DynamicPatchGAN
+    _target_: eo_vae.models.modules.consistency_loss.EOConsistencyLoss
+    rec_loss_type: "char"
+    pixel_weight: 1.0
+    msssim_weight: 1.0
+    spatial_weight: 0.0
+    freq_weight: 0.0
+    spectral_weight: 0.0
+    feature_weight: 0.0
+    msssim_start_step: 2000
+    # _target_: eo_vae.models.modules.consistency_loss.EOPatchLoss
+    # disc_start: 4000
+    # disc_weight: 0.5
+    # ssim_weight: 0.2
+    # discriminator:
+    #   _target_: eo_vae.models.modules.consistency_loss.DynamicPatchGAN
       
   
   

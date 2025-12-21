@@ -4,6 +4,7 @@ import os
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+import random
 from lightning import LightningModule
 from safetensors import safe_open
 from torch import Tensor
@@ -74,6 +75,10 @@ class FluxAutoencoderKL(LightningModule):
         warmup_epochs: int | None = None,
         decay_end_epoch: int | None = None,
         clip_grad: float | None = None,
+        # --- EQ-VAE Hyperparameters ---
+        p_prior: float = 0.0,  # Probability of latent regularization
+        p_prior_s: float = 0.0,  # Probability of image-level prior preservation
+        anisotropic: bool = False,  # Allow different x/y scaling
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -86,6 +91,11 @@ class FluxAutoencoderKL(LightningModule):
         self.base_lr = base_lr
         self.final_lr_sched = final_lr_sched
         self.clip_grad = clip_grad
+
+        # eq-vae specific
+        self.p_prior = p_prior
+        self.p_prior_s = p_prior_s
+        self.anisotropic = anisotropic
 
         self.automatic_optimization = False
 
@@ -366,12 +376,33 @@ class FluxAutoencoderKL(LightningModule):
         input: torch.Tensor,
         wvs: torch.Tensor,
         sample_posterior: bool = True,
-        use_refiner: bool = False,
+        scale: float | tuple[float, float] | None = None,
+        angle: int | None = None,
+        use_refiner=False,
     ):
         posterior = self.encode(input, wvs)
         z = posterior.sample() if sample_posterior else posterior.mode()
 
-        # Flux Process: Shuffle -> Normalize
+        # EQ-VAE: Apply transformations
+        if scale is not None:
+            h, w = z.shape[-2:]
+            # Calculate new dims that are multiples of the patch size (self.ps)
+            if isinstance(scale, (tuple, list)):
+                new_h = round(h * scale[0] / self.ps[0]) * self.ps[0]
+                new_w = round(w * scale[1] / self.ps[1]) * self.ps[1]
+            else:
+                new_h = round(h * scale / self.ps[0]) * self.ps[0]
+                new_w = round(w * scale / self.ps[1]) * self.ps[1]
+
+            # Use explicit 'size' instead of 'scale_factor' to guarantee divisibility
+            z = F.interpolate(
+                z, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
+
+        if angle is not None:
+            z = torch.rot90(z, k=angle, dims=[-1, -2])
+
+        # Now rearrange will always work because new_h and new_w are multiples of 2
         z_shuffled = rearrange(
             z, '... c (i pi) (j pj) -> ... (c pi pj) i j', pi=self.ps[0], pj=self.ps[1]
         )
@@ -382,6 +413,7 @@ class FluxAutoencoderKL(LightningModule):
         if use_refiner:
             # Pass through flow refiner
             dec = self.refine(dec, wvs=wvs)
+
         return dec, posterior
 
     def normalize_latent(self, z):
@@ -484,29 +516,62 @@ class FluxAutoencoderKL(LightningModule):
             sch_gen = schs
             sch_disc = None
 
-        images = self.get_input(batch, self.image_key)
+        images = self.get_input(batch, self.image_key)  # Original full-res [B, C, H, W]
         wvs = batch['wvs']
 
-        # Determine if discriminator should be trained
-        train_disc = (
-            opt_disc is not None
-            and self.global_step >= self.loss_fn.disc_start
-            and self.loss_fn.disc_weight > 0.0
-        )
+        # EQ-VAE Hyperparams / State
+        # Discrete bins [8/32, 16/32, 24/32] -> [0.25, 0.5, 0.75]
+        # This prevents the 'new shape every batch' slowdown
+        scale_bins = [0.25, 0.5, 0.75]
+        current_mode = 'standard'
 
-        # =====================
-        # Generator Training
-        # =====================
+        # =========================================================
+        # 1. EQ-VAE REGULARIZATION & FORWARD PASS
+        # =========================================================
+
+        if random.random() < self.p_prior:
+            current_mode = 'latent_equivariance'
+            angle = random.choice([1, 2, 3])
+            if self.anisotropic:
+                scale = (random.choice(scale_bins), random.choice(scale_bins))
+            else:
+                scale = random.choice(scale_bins)
+
+            recon, posterior = self.forward(images, wvs, scale=scale, angle=angle)
+
+            # Match ground truth to the transformed latent output
+            with torch.no_grad():
+                target_images = F.interpolate(
+                    images, size=recon.shape[-2:], mode='area'
+                )
+                target_images = torch.rot90(target_images, k=angle, dims=[-1, -2])
+
+        elif random.random() < self.p_prior_s:
+            current_mode = 'prior_preservation'
+            scale = random.choice(scale_bins)
+
+            recon, posterior = self.forward(images, wvs, scale=scale)
+
+            with torch.no_grad():
+                target_images = F.interpolate(
+                    images, size=recon.shape[-2:], mode='area'
+                )
+
+        else:
+            # Standard full-resolution reconstruction
+            recon, posterior = self.forward(images, wvs)
+            target_images = images
+
+        # =========================================================
+        # 2. GENERATOR TRAINING
+        # =========================================================
         opt_gen.zero_grad()
         if opt_disc is not None and hasattr(self.loss_fn, 'discriminator'):
             self.loss_fn.discriminator.eval()
 
-        # Forward pass: encode and decode
-        recon, _ = self.forward(images, wvs)
-
-        # Compute generator loss
+        # Pass the correctly sized target_images (matching recon)
         gen_loss, log_dict_gen = self.loss_fn(
-            inputs=images,
+            inputs=target_images,
             wvs=wvs,
             reconstructions=recon,
             optimizer_idx=0,
@@ -515,10 +580,8 @@ class FluxAutoencoderKL(LightningModule):
             split='train',
         )
 
-        # Backward pass
         self.manual_backward(gen_loss)
 
-        # Gradient clipping
         if self.clip_grad is not None:
             torch.nn.utils.clip_grad_norm_(
                 opt_gen.param_groups[0]['params'], self.clip_grad
@@ -528,45 +591,46 @@ class FluxAutoencoderKL(LightningModule):
         if sch_gen is not None:
             sch_gen.step()
 
-        # =====================
-        # Discriminator Training
-        # =====================
+        # =========================================================
+        # 3. DISCRIMINATOR TRAINING
+        # =========================================================
+        train_disc = (
+            opt_disc is not None
+            and self.global_step >= self.loss_fn.disc_start
+            and self.loss_fn.disc_weight > 0.0
+        )
+
         if train_disc:
             if hasattr(self.loss_fn, 'discriminator'):
                 self.loss_fn.discriminator.train()
 
-            disc_updates = getattr(self.loss_fn, 'disc_updates_per_step', 1)
+            opt_disc.zero_grad()
+            # Use target_images so the discriminator learns on the same transformations
+            recon_detached = recon.detach()
 
-            for _ in range(disc_updates):
-                opt_disc.zero_grad()
+            disc_loss, log_dict_disc = self.loss_fn(
+                inputs=target_images,
+                wvs=wvs,
+                reconstructions=recon_detached,
+                optimizer_idx=1,
+                global_step=self.global_step,
+                last_layer=None,
+                split='train',
+            )
 
-                # Re-compute reconstruction (detached)
-                # recon_detached, _ = self.forward(images, wvs)
-                recon_detached = recon.detach()
-
-                # Compute discriminator loss
-                disc_loss, log_dict_disc = self.loss_fn(
-                    inputs=images,
-                    wvs=wvs,
-                    reconstructions=recon_detached,
-                    optimizer_idx=1,
-                    global_step=self.global_step,
-                    last_layer=None,
-                    split='train',
-                )
-
-                self.manual_backward(disc_loss)
-                opt_disc.step()
+            self.manual_backward(disc_loss)
+            opt_disc.step()
 
             if sch_disc is not None:
                 sch_disc.step()
 
-            if hasattr(self.loss_fn, 'discriminator'):
-                self.loss_fn.discriminator.eval()
-
-        # Logging
+        # =========================================================
+        # 4. LOGGING
+        # =========================================================
         log_dict = {**log_dict_gen}
         log_dict['train/lr_gen'] = opt_gen.param_groups[0]['lr']
+        # log_dict[f'train/mode_{current_mode}'] = 1.0 # Useful for debugging balance
+
         if train_disc:
             log_dict['train/lr_disc'] = opt_disc.param_groups[0]['lr']
             log_dict.update(log_dict_disc)
