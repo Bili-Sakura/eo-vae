@@ -429,6 +429,58 @@ class FluxAutoencoderKL(LightningModule):
         m = self.bn.running_mean.view(1, -1, 1, 1)
         return z * s + m
 
+    @torch.no_grad()
+    def encode_to_latent(self, x: Tensor, wvs: Tensor) -> Tensor:
+        """Encode to normalized latent space."""
+        posterior = self.encode(x, wvs)
+        z = posterior.mode()
+        z_shuffled = rearrange(
+            z, '... c (i pi) (j pj) -> ... (c pi pj) i j',
+            pi=self.ps[0], pj=self.ps[1]
+        )
+        return self.normalize_latent(z_shuffled)
+    
+    @torch.no_grad()
+    def encode_spatial_normalized(self, x: Tensor, wvs: Tensor) -> Tensor:
+        """
+        Encode to spatially-structured normalized latent.
+        
+        Process:
+        1. Encode -> z
+        2. Shuffle -> z_shuffled
+        3. BN using VAE stats -> z_norm
+        4. Unshuffle -> z_spatial
+        
+        Returns: [B, C, H, W] where C=32, preserving spatial layout but with VAE normalization applied.
+        """
+        # Get normalized packed latent [B, 128, H/16, W/16]
+        z_norm = self.encode_to_latent(x, wvs)
+        
+        # Unshuffle back to spatial [B, 32, H/8, W/8]
+        z_spatial = rearrange(
+            z_norm, '... (c pi pj) i j -> ... c (i pi) (j pj)',
+            pi=self.ps[0], pj=self.ps[1]
+        )
+        return z_spatial
+
+    @torch.no_grad()
+    def decode_spatial_normalized(self, z: Tensor, wvs: Tensor) -> Tensor:
+        """
+        Decode from spatially-structured normalized latent.
+        
+        Process:
+        1. Shuffle -> z_packed
+        2. Inverse BN (handled by decode)
+        3. Unshuffle & Decode (handled by decode)
+        """
+        # Shuffle to packed format [B, 128, H/16, W/16]
+        z_packed = rearrange(
+            z, '... c (i pi) (j pj) -> ... (c pi pj) i j',
+            pi=self.ps[0], pj=self.ps[1]
+        )
+        # Decode expects packed normalized latent
+        return self.decode(z_packed, wvs)
+
     # =========================================================
     #  TRAINING & VALIDATION ROUTING
     # =========================================================

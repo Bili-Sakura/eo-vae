@@ -104,31 +104,19 @@ class Encoder(nn.Module):
 
             mode = dynamic_kwargs.pop('mode', 'conv')  # 'conv' or 'basis'
 
-            if mode == 'basis':
-                # ...existing code...
-                num_bases = dynamic_kwargs.pop('num_bases', 64)
-                rank_dim = dynamic_kwargs.pop('rank_dim', 32)
+            # ...existing code...
+            wv_planes = dynamic_kwargs.pop('wv_planes', 128)
+            inter_dim = dynamic_kwargs.pop('inter_dim', 128)
 
-                self.conv_in = DynamicInputLayer(
-                    out_channels=self.ch,
-                    num_bases=num_bases,
-                    rank_dim=rank_dim,
-                    kernel_size=3,
-                )
-            else:
-                # ...existing code...
-                wv_planes = dynamic_kwargs.pop('wv_planes', 128)
-                inter_dim = dynamic_kwargs.pop('inter_dim', 128)
-
-                self.conv_in = DynamicConv(
-                    wv_planes=wv_planes,
-                    inter_dim=inter_dim,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    embed_dim=self.ch,
-                    **dynamic_kwargs,
-                )
+            self.conv_in = DynamicConv(
+                wv_planes=wv_planes,
+                inter_dim=inter_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                embed_dim=self.ch,
+                **dynamic_kwargs,
+            )
         else:
             self.conv_in = nn.Conv2d(
                 in_channels, self.ch, kernel_size=3, stride=1, padding=1
@@ -324,33 +312,19 @@ class Decoder(nn.Module):
 
             mode = dynamic_kwargs.pop('mode', 'conv')
 
-            if mode == 'basis':
-                # ...existing code...
-                num_bases = dynamic_kwargs.pop('num_bases', 64)
-                rank_dim = dynamic_kwargs.pop('rank_dim', 32)
+            wv_planes = dynamic_kwargs.pop('wv_planes', 128)
+            inter_dim = dynamic_kwargs.pop('inter_dim', 128)
 
-                self.conv_out = DynamicOutputLayer(
-                    in_channels=block_in,
-                    num_bases=num_bases,
-                    rank_dim=rank_dim,
-                    kernel_size=3,
-                )
-            else:
-                # ...existing code...
-                wv_planes = dynamic_kwargs.pop('wv_planes', 128)
-                inter_dim = dynamic_kwargs.pop('inter_dim', 128)
-
-                self.conv_out = DynamicConv_decoder(
-                    wv_planes=wv_planes,
-                    inter_dim=inter_dim,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    embed_dim=block_in,
-                    **dynamic_kwargs,
-                )
+            self.conv_out = DynamicConv_decoder(
+                wv_planes=wv_planes,
+                inter_dim=inter_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                embed_dim=block_in,
+                **dynamic_kwargs,
+            )
         else:
-            # ...existing code...
             self.conv_out = nn.Conv2d(
                 block_in, out_ch, kernel_size=3, stride=1, padding=1
             )

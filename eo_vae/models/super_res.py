@@ -1,14 +1,40 @@
 """Lightning Module to train Prior Diffusion model."""
 
+import math
 from functools import partial
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
 
 from lightning import LightningModule
 from lightning.pytorch.cli import LRSchedulerCallable, OptimizerCallable
+
+
+def get_cosine_schedule_with_warmup(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    base_lr: float,
+    final_lr: float,
+    num_cycles: float = 0.5,
+) -> LambdaLR:
+    """Create a schedule with linear warmup and cosine decay."""
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * progress))
+        lr_scale = (base_lr - final_lr) * cosine_decay + final_lr
+        return lr_scale / base_lr
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 class DiffusionSuperRes(LightningModule):
@@ -20,6 +46,10 @@ class DiffusionSuperRes(LightningModule):
         sampler: partial[nn.Module],
         optimizer: OptimizerCallable = torch.optim.Adam,
         lr_scheduler: LRSchedulerCallable | None = None,
+        base_lr: float = 1e-4,
+        final_lr: float | None = None,
+        warmup_epochs: int | None = None,
+        decay_end_epoch: int | None = None,
     ) -> None:
         """Initialize the DiffusionModule.
 
@@ -28,6 +58,10 @@ class DiffusionSuperRes(LightningModule):
             sampler: the sampling model (e.g., DDIMSampler)
             optimizer: the optimizer to use
             lr_scheduler: the learning rate scheduler to use
+            base_lr: base learning rate
+            final_lr: final learning rate after decay
+            warmup_epochs: number of warmup epochs
+            decay_end_epoch: epoch to end decay
         """
         super().__init__()
         self.denoiser = denoiser
@@ -35,6 +69,12 @@ class DiffusionSuperRes(LightningModule):
 
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
+
+        self.base_lr = base_lr
+        self.final_lr = final_lr
+        self.warmup_epochs = warmup_epochs
+        self.decay_end_epoch = decay_end_epoch
+
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
         """Forward pass through the denoiser.
@@ -125,7 +165,28 @@ class DiffusionSuperRes(LightningModule):
         Returns:
             a "lr dict" according to the pytorch lightning documentation
         """
-        optimizer = self.optimizer(self.denoiser.parameters())
+        if self.base_lr is not None:
+            optimizer = self.optimizer(self.denoiser.parameters(), lr=self.base_lr)
+        else:
+            optimizer = self.optimizer(self.denoiser.parameters())
+
+        if all([self.final_lr, self.warmup_epochs, self.decay_end_epoch]) and self.base_lr is not None:
+            steps_per_epoch = 152  # Estimate
+            num_warmup = self.warmup_epochs * steps_per_epoch
+            num_total = self.decay_end_epoch * steps_per_epoch
+
+            lr_scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=num_warmup,
+                num_training_steps=num_total,
+                base_lr=self.base_lr,
+                final_lr=self.final_lr,
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': lr_scheduler, 'interval': 'step'},
+            }
+
         if self.lr_scheduler is not None:
             lr_scheduler = self.lr_scheduler(optimizer)
             return {
@@ -134,3 +195,4 @@ class DiffusionSuperRes(LightningModule):
             }
         else:
             return {'optimizer': optimizer}
+

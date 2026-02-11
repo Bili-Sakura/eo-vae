@@ -1,7 +1,7 @@
 
 experiment:
-  experiment_name: "eo-vae-eq"
-  exp_dir: "results/exps/eo-vae/finetune"
+  experiment_name: "eo-vae-rob-freq"
+  exp_dir: "results/exps/eo-vae/robust"
 
 wandb:
   project: eo-vae
@@ -20,27 +20,18 @@ model:
   clip_grad: 1.0
 
   # eq vae
-  p_prior: 0.5
-  p_prior_s: 0.25
-  anisotropic: False
+  # p_prior: 0.5
+  # p_prior_s: 0.25
+  # anisotropic: False
 
   # Loss configuration
   loss_fn:
-    _target_: eo_vae.models.modules.consistency_loss.EOConsistencyLoss
-    rec_loss_type: "char"
-    pixel_weight: 1.0
-    msssim_weight: 1.0
-    spatial_weight: 0.0
-    freq_weight: 0.0
-    spectral_weight: 0.0
-    feature_weight: 0.0
-    msssim_start_step: 2000
-    # _target_: eo_vae.models.modules.consistency_loss.EOPatchLoss
-    # disc_start: 4000
-    # disc_weight: 0.5
-    # ssim_weight: 0.2
-    # discriminator:
-    #   _target_: eo_vae.models.modules.consistency_loss.DynamicPatchGAN
+    _target_: eo_vae.models.modules.consistency_loss.EOPatchLoss
+    disc_start: 4000
+    disc_weight: 0.5
+    ssim_weight: 0.2
+    discriminator:
+      _target_: eo_vae.models.modules.consistency_loss.DynamicPatchGAN
       
   
   
@@ -74,25 +65,26 @@ model:
 datamodule:
   _target_: eo_vae.datasets.terramesh_datamodule.TerraMeshDataModule
   data_path: "/mnt/SSD2/nils/datasets/terramesh"
-  modalities: ["S2L2A", "S2RGB", "S2L1C", "S1RTC"]  # Load modalities
+  modalities: ["S2L2A", "S2L1C", "S1RTC"]  # Load modalities
   batch_size: 16
   eval_batch_size: 32
   num_workers: 4
   train_collate_mode: "random"  # Randomly select modality per batch
   val_collate_mode: "S2L2A"     # Always use S2L2A for validation
   normalize: true
+  norm_method: robust
   target_size: [256, 256]
 
 trainer:
   _target_: lightning.Trainer
-  max_epochs: 25
+  max_epochs: 50
   accelerator: gpu
   precision: 16-mixed
   #strategy: ddp
   # strategy: ddp_find_unused_parameters_true
   limit_val_batches: 100
   limit_train_batches: 2000 # choose 1000 iterable dataset batches to have control over params
-  devices: [2]
+  devices: [5]
   #devices: [0,1,2,3]
   # accumulate_grad_batches: 2
   #gradient_clip_val: 1.0

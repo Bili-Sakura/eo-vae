@@ -1,6 +1,6 @@
 
 experiment:
-  experiment_name: "eo-vae-sr-old"
+  experiment_name: "eo-vae-sr-batch-karras-decay"
   exp_dir: "results/exps/eo-vae/sr"
 
 wandb:
@@ -15,9 +15,9 @@ trainer:
   limit_val_batches: 10
   # limit_train_batches: 2000 # choose 1000 iterable dataset batches to have control over params
   # strategy: ddp_find_unused_parameters_true
-  devices: [5]
+  devices: [6]
   log_every_n_steps: 20
-  gradient_clip_val: 1.0
+  gradient_clip_val: 0.5
 
 
 lightning_module:
@@ -30,7 +30,7 @@ lightning_module:
     _target_: torch.optim.Adam
     _partial_: true
   denoiser:
-    _target_: azula.denoise.SimpleDenoiser
+    _target_: azula.denoise.KarrasDenoiser
     # _target_: eo_vae.models.my_flow_model.MySimpleDenoiser
     backbone:
       _target_: azula.nn.unet.UNet
@@ -41,7 +41,7 @@ lightning_module:
       hid_blocks: [3, 3, 3]
       spatial: 2 #
     schedule:
-      _target_: azula.noise.RectifiedSchedule
+      _target_: azula.noise.DecaySchedule
   sampler:
     _target_: azula.sample.DDIMSampler
     _partial_: true
@@ -80,8 +80,8 @@ autoencoder:
 
 datamodule:
   _target_: eo_vae.datasets.sen2naip.Sen2NaipLatentCrossSensorDataModule
-  root: /mnt/SSD2/nils/datasets/sen2naip/cross-sensor/eo-vae-old/eo-vae-spatial-norm
+  root: /mnt/SSD2/nils/datasets/sen2naip/cross-sensor/eo-vae-batch-norm/eo-vae-spatial-norm
   batch_size: 16
   num_workers: 4
   latent_scale_factor: 1.0
-  normalize: True
+  normalize: False # we use batch norm encoded latents

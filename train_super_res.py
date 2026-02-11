@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 import cartopy
 from hydra.utils import instantiate
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from omegaconf import OmegaConf
 
@@ -78,12 +78,16 @@ def run_experiment(config, debug: bool = False) -> None:
             save_last=True,
             every_n_epochs=1,
         )
+        lr_monitor = LearningRateMonitor(logging_interval='step')
 
-    callbacks = [checkpoint_callback, img_logger] if checkpoint_callback else []
+
+    callbacks = [checkpoint_callback, img_logger, lr_monitor] if checkpoint_callback else []
 
     trainer = instantiate(config.trainer, callbacks=callbacks, logger=loggers)
 
     if not debug:
+        # add vae_ckpt to config
+        config["vae_ckpt"] = args.ckpt
         with open(
             os.path.join(config['experiment']['save_dir'], 'config.yaml'), 'w'
         ) as f:

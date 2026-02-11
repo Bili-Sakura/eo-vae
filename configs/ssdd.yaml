@@ -13,7 +13,8 @@ model:
 
   lr: 2e-4
   final_lr: 2e-5
-  warmup_steps: ${trainer.limit_train_batches}
+  # warmup_steps: ${trainer.limit_train_batches}
+  warmup_steps: 2000
   max_steps: "${eval:'${trainer.limit_train_batches} * ${trainer.max_epochs}'}"
       
   encoder:
@@ -52,25 +53,26 @@ model:
 datamodule:
   _target_: eo_vae.datasets.terramesh_datamodule.TerraMeshDataModule
   data_path: "/mnt/SSD2/nils/datasets/terramesh"
-  modalities: ["S2RGB", "S2L2A"]  # Load modalities
+  modalities: ["S2L2A", "S1RTC", "S2L1C"]  # Load modalities
   batch_size: 8
   eval_batch_size: 16
   num_workers: 2
   train_collate_mode: "random"  # Randomly select modality per batch
-  val_collate_mode: "S2RGB"     # Always use S2L2A for validation
+  val_collate_mode: "S2L2A"     # Always use S2L2A for validation
   normalize: true
+  norm_method: robust
   target_size: [256, 256]
 
 trainer:
   _target_: lightning.Trainer
-  max_epochs: 25
+  max_epochs: 40
   accelerator: gpu
   precision: 16-mixed
   #strategy: ddp
   # strategy: ddp_find_unused_parameters_true
   limit_val_batches: 10
-  limit_train_batches: 2000 # choose 1000 iterable dataset batches to have control over params
-  devices: [3]
+  limit_train_batches: 4000 # choose 1000 iterable dataset batches to have control over params
+  devices: [6]
   #devices: [0,1,2,3]
   # accumulate_grad_batches: 2
   gradient_clip_val: 1.0

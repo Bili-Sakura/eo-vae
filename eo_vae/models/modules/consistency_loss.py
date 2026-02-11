@@ -331,16 +331,16 @@ class EOConsistencyLoss(nn.Module):
         self,
         pixel_weight: float = 1.0,  # Reconstruction loss weight (L1 or Charbonnier)
         rec_loss_type: str = 'l1',  # 'l1' or 'char' for reconstruction loss
-        spectral_weight: float = 0.5,  # SAM for spectral accuracy
-        spatial_weight: float = 0.5,  # Gradient for edges
-        freq_weight: float = 0.1,  # FFT for textures
+        spectral_weight: float = 0.0,  # SAM for spectral accuracy
+        spatial_weight: float = 0.0,  # Gradient for edges
+        freq_weight: float = 0.0,  # FFT for textures
         feature_weight: float = 0.0,  # Optional DOFA features
         msssim_weight: float = 0.0,  # MS-SSIM loss
-        spectral_start_step: int = 1000,
-        spatial_start_step: int = 2000,
-        freq_start_step: int = 5000,
-        feature_start_step: int = 5000,
-        msssim_start_step: int = 2000,
+        spectral_start_step: int = 0,
+        spatial_start_step: int = 0,
+        freq_start_step: int = 0,
+        feature_start_step: int = 0,
+        msssim_start_step: int = 0,
         patch_factor: int = 2,
         ffl_alpha: float = 1.0,
         dofa_net: nn.Module = None,
@@ -406,7 +406,7 @@ class EOConsistencyLoss(nn.Module):
         **kwargs,
     ):
         # clamp reconstructions to valid range
-        reconstructions = torch.clamp(reconstructions, -1.0, 1.0)
+        # reconstructions = torch.clamp(reconstructions, -1.0, 1.0)
 
         logs = {}
         # Initialize as tensor to ensure device consistency

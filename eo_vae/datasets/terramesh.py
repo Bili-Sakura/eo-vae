@@ -33,6 +33,10 @@ import zarr
 from torch.utils.data._utils.collate import default_collate
 from webdataset.handlers import warn_and_continue
 
+# January 24, 2022 - Sentinel-2 L2A processing baseline change date (nanoseconds)
+# Images ON OR AFTER this date need +1000 offset correction
+S2L2A_BASELINE_CUTOFF_NS = 1642982400000000000  # 2022-01-24 00:00:00 UTC
+
 # Definition of all shard files in TerraMesh
 split_files = {
     'ssl4eos12': {
@@ -143,6 +147,7 @@ def build_terramesh_dataset(
     time_dim: bool = False,
     partial: bool = None,
     probs: list[int] = None,
+    harmonize_s2l2a: bool = False,
     **kwargs,
 ):
     """Builds a dataset for TerraMesh, see https://huggingface.co/datasets/ibm-esa-geospatial/TerraMesh.
@@ -164,6 +169,7 @@ def build_terramesh_dataset(
     :param time_dim: If True, keeps time dimension. Defaults to False.
     :param partial: Load partial batch at the end. Defaults to False for train and True for val.
     :param probs: List of probabilities for each subset (majortom and ssl4eos12). Defaults to [0.8, 0.2].
+    :param harmonize_s2l2a: If True, applies +1000 offset to S2L2A images captured on/after Jan 24, 2022.
     :return: WebDataset (single modality) or DataPipeline (multiple modalities)
     """
     if len(modalities) == 1:
@@ -192,6 +198,7 @@ def build_terramesh_dataset(
             seed=seed,
             time_dim=time_dim,
             partial=partial,
+            harmonize_s2l2a=harmonize_s2l2a,
             **kwargs,
         )
         return dataset
@@ -216,6 +223,7 @@ def build_terramesh_dataset(
             time_dim=time_dim,
             partial=partial,
             probs=probs,
+            harmonize_s2l2a=harmonize_s2l2a,
         )
         return dataset
 
@@ -225,35 +233,61 @@ def zarr_decoding(key, value):
         mapper = fsspec.filesystem(
             'zip', fo=io.BytesIO(value), block_size=None
         ).get_mapper('')
-        return zarr.open_consolidated(mapper, mode='r')['bands'][...]
+        return zarr.open_consolidated(mapper, mode='r')['bands'][...].astype(np.float32)
 
 
-def zarr_metadata_decoding(sample):
+def zarr_decoding_harmonized(key, value):
+    """Fast zarr decoder with S2L2A harmonization - only reads bands and time."""
+    if key == 'zarr.zip' or key.endswith('.zarr.zip'):
+        mapper = fsspec.filesystem(
+            'zip', fo=io.BytesIO(value), block_size=None
+        ).get_mapper('')
+        data = zarr.open_consolidated(mapper, mode='r')
+        bands = data['bands'][...].astype(np.float32)
+        timestamp = data['time'][...]
+        
+        # Apply +1000 shift for post-baseline images
+        if timestamp >= S2L2A_BASELINE_CUTOFF_NS:
+            bands = bands + 1000.0
+        
+        return bands
+
+
+def zarr_metadata_decoding(sample, harmonize_s2l2a: bool = False):
     for key, value in list(sample.items()):
         if key == 'zarr.zip' or key.endswith('.zarr.zip'):
             mapper = fsspec.filesystem(
                 'zip', fo=io.BytesIO(value), block_size=None
             ).get_mapper('')
             data = zarr.open_consolidated(mapper, mode='r')
-            sample[key] = data['bands'][...]
+            bands = data['bands'][...].astype(np.float32)
+            timestamp = data['time'][...]
+
+            # In multimodal, keys are 'S2L2A.zarr.zip'. 
+            # In single modality, key is 'zarr.zip' (and the caller ensures harmonize_s2l2a is only True for S2L2A).
+            is_s2l2a_key = 'S2L2A' in key or key == 'zarr.zip'
+            
+            # Apply S2L2A harmonization ONLY if it's the correct modality
+            if harmonize_s2l2a and is_s2l2a_key and timestamp >= S2L2A_BASELINE_CUTOFF_NS:
+                bands = bands + 1000.0
+            
+            sample[key] = bands
 
             # Add metadata
             if (
                 'center_lon' not in sample.keys()
             ):  # Same center point for all modalities
-                sample['center_lon'] = data['center_lon'][...]
-                sample['center_lat'] = data['center_lat'][...]
+                sample['center_lon'] = data['center_lon'][...].copy()
+                sample['center_lat'] = data['center_lat'][...].copy()
             if (
                 'cloud_mask' in data and 'cloud_mask' not in sample.keys()
             ):  # Same S2 mask in all optical modalities
                 sample['cloud_mask'] = data['cloud_mask'][...][
                     np.newaxis, ...
-                ]  # Add channel dim to mask
-            if data['time'][...] > 1e6:  # DEM has no valid timestamp (value = 0)
+                ].copy()  # Add channel dim to mask
+            if timestamp > 1e6:  # DEM has no valid timestamp (value = 0)
                 time_key = 'time' if key == 'zarr.zip' else 'time_' + key
-                sample[time_key] = data['time'][
-                    ...
-                ]  # Integer values of type "datetime64[ns]"
+                sample[time_key] = timestamp  # Integer values of type "datetime64[ns]"
         elif isinstance(value, str):
             # Skip str data
             pass
@@ -262,6 +296,13 @@ def zarr_metadata_decoding(sample):
             sample[key] = next(wds.decode()([{key: value}]))[key]
 
     return sample
+
+
+def make_zarr_metadata_decoder(harmonize_s2l2a: bool = False):
+    """Factory function to create zarr_metadata_decoding with harmonization option."""
+    def decoder(sample):
+        return zarr_metadata_decoding(sample, harmonize_s2l2a=harmonize_s2l2a)
+    return decoder
 
 
 def identity(sample):
@@ -277,12 +318,16 @@ def drop_time_dim(value, dim: int = 0):
         return value.squeeze(dim)
 
     elif isinstance(value, dict):
-        for k, v in value.items():
-            if (isinstance(v, np.ndarray) or isinstance(v, torch.Tensor)) and v.shape[
-                dim
-            ] == 1:
-                value[k] = v.squeeze(dim)
-        return value
+        if "image" in value:
+            value["image"] = value["image"].squeeze(dim)
+            return value
+        else:
+            # multimodal case
+            for k, v in value.items():  
+                if (isinstance(v, np.ndarray) or isinstance(v, torch.Tensor)):
+                    # if v.shape[dim] == 1:
+                    value[k] = v.squeeze(dim)
+            return value
     else:
         return value
 
@@ -302,6 +347,7 @@ def build_wds_dataset(
     time_dim: bool = False,
     partial: bool = False,
     shuffle: bool = False,
+    harmonize_s2l2a: bool = False,
     *args,
     **kwargs,
 ):
@@ -309,7 +355,7 @@ def build_wds_dataset(
         # Select split files
         if modality == 'S1GRD':
             files = split_files['ssl4eos12'][split]
-        elif modality == 'S1GRD':
+        elif modality == 'S1RTC':
             files = split_files['majortom'][split]
         else:
             files = split_files['combined'][split]
@@ -336,11 +382,18 @@ def build_wds_dataset(
     )
 
     # Decode from bytes to numpy arrays, etc.
-    dataset = (
-        dataset.map(zarr_metadata_decoding)
-        if return_metadata
-        else dataset.decode(zarr_decoding)
-    )
+    # Choose decoder based on requirements:
+    # 1. return_metadata=True -> full metadata decoder (slower)
+    # 2. harmonize_s2l2a=True for S2L2A -> fast harmonized decoder
+    # 3. otherwise -> basic fast decoder
+    # if return_metadata:
+    #     should_harmonize = harmonize_s2l2a and modality == 'S2L2A'
+    #     dataset = dataset.map(make_zarr_metadata_decoder(harmonize_s2l2a=should_harmonize))
+    if harmonize_s2l2a and modality == 'S2L2A':
+        # Fast path: use decode() with harmonized decoder (same speed as legacy)
+        dataset = dataset.decode(zarr_decoding_harmonized)
+    else:
+        dataset = dataset.decode(zarr_decoding)
 
     # Rename modality to "image" and remove temporal dimension
     dataset = dataset.rename(image='zarr.zip')
@@ -374,7 +427,14 @@ def _subset_pipeline(
     transform,
     time_dim,
     partial,
+    harmonize_s2l2a=False,
 ):
+    # Determine decoder based on metadata and harmonization needs
+    if return_metadata or harmonize_s2l2a:
+        decoder = wds.map(make_zarr_metadata_decoder(harmonize_s2l2a=harmonize_s2l2a))
+    else:
+        decoder = wds.decode(zarr_decoding)
+    
     return wds.DataPipeline(
         wds.ResampledShards(
             urls, deterministic=deterministic, seed=seed, empty_check=empty_check
@@ -387,11 +447,7 @@ def _subset_pipeline(
         multi_tarfile_samples,
         wds.shuffle(shardshuffle, seed=seed),
         # Decode from bytes to numpy arrays, etc.
-        (
-            wds.map(zarr_metadata_decoding)
-            if return_metadata
-            else wds.decode(zarr_decoding)
-        ),
+        decoder,
         # Remove time dimension from tensors
         wds.map(drop_time_dim) if not time_dim else wds.map(identity),
         wds.map(remove_extensions),
@@ -415,6 +471,7 @@ def build_multimodal_dataset(
     time_dim: bool = True,
     partial: bool = False,
     probs: list[int] = None,
+    harmonize_s2l2a: bool = False,
 ):
     if modalities is None:
         modalities = [
@@ -427,6 +484,10 @@ def build_multimodal_dataset(
             'NDVI',
             'LULC',
         ]  # Default
+    
+    # Only apply harmonization if S2L2A is in the modalities
+    should_harmonize = harmonize_s2l2a and 'S2L2A' in modalities
+    
     if urls is None:
         # Filter modalities based availability (S1GRD and S1RTC not present in all subsets)
         def filter_list(lst, value):
@@ -465,6 +526,7 @@ def build_multimodal_dataset(
         transform=transform,
         time_dim=time_dim,
         partial=partial,
+        harmonize_s2l2a=should_harmonize,
     )
 
     ds_ssl = _subset_pipeline(
@@ -478,6 +540,7 @@ def build_multimodal_dataset(
         transform=transform,
         time_dim=time_dim,
         partial=partial,
+        harmonize_s2l2a=should_harmonize,
     )
 
     # mix batches (never mixes samples)

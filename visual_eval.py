@@ -6,22 +6,28 @@ import numpy as np
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from einops import rearrange
+from tqdm import tqdm  # Added for progress bar
 
-# Import your specific normalization logic
-from eo_vae.datasets.terramesh_datamodule import normalize_image, unnormalize_image
-
+from eo_vae.datasets.terramesh_datamodule import NormalizerFactory
 from terratorch.registry import FULL_MODEL_REGISTRY
 
-OmegaConf.register_new_resolver('eval', eval)
+OmegaConf.register_new_resolver('eval', eval, replace=True)
+
+
+def get_norm_scheme(cfg) -> str:
+    """Extract normalization scheme from config, defaulting to 'legacy'."""
+    return cfg.datamodule.get('norm_scheme', 'legacy')
+
+
+def unnormalize(img, modality, scheme, device):
+    """Unnormalize image from normalized space back to raw physical units."""
+    normalizer = NormalizerFactory.create(modality, scheme).to(device)
+    return img * normalizer.std + normalizer.mean
 
 
 def build_terramind_model(
     modality: str, base_ckpt_dir: str = '/mnt/SSD2/nils/eo-vae/checkpoints/terramind'
 ):
-    """
-    Dynamically builds the correct TerraMind model based on modality.
-    """
-    # 1. Infer Model Name & Checkpoint Filename
     if modality in ['S2L2A', 'S2RGB']:
         model_name = 'terramind_v1_tokenizer_s2l2a'
         ckpt_filename = 'TerraMind_Tokenizer_S2L2A.pt'
@@ -31,181 +37,189 @@ def build_terramind_model(
     else:
         raise ValueError(f'TerraMind not implemented for modality: {modality}')
 
-    # 2. Build Path
     ckpt_path = os.path.join(base_ckpt_dir, ckpt_filename)
-
     print(f'Loading TerraMind: {model_name} | CKPT: {ckpt_path}')
-
-    # 3. Build Model
     return FULL_MODEL_REGISTRY.build(model_name, pretrained=True, ckpt_path=ckpt_path)
 
 
 def get_display_image(tensor, modality):
     """Convert raw (unnormalized) tensor to (H, W, 3) numpy image for plotting."""
     tensor = tensor.cpu().detach()
+
+    def percentile_norm(x, p_min=2, p_max=98):
+        mn, mx = np.percentile(x, p_min), np.percentile(x, p_max)
+        return (x - mn) / (mx - mn + 1e-16)
+    
     if modality == 'S2L2A':
-        # RGB indices for S2L2A: Red(3), Green(2), Blue(1). Scale DN(3000)->1.0
-        img = tensor[[3, 2, 1], :, :]
-        img = torch.clamp(img / 3000.0, 0, 1)
+        img = tensor[[3, 2, 1], :, :]  # RGB bands
+        return torch.clamp(img / 4000.0, 0, 1).permute(1, 2, 0).numpy()
     elif modality == 'S1RTC':
-        # False color: R=VV, G=VH, B=Ratio
-        vv, vh = tensor[0], tensor[1]
-        ratio = vh - vv
-        img = torch.stack([vv, vh, ratio])
-        # Robust min-max for visualization
-        for c in range(3):
-            mn, mx = img[c].quantile(0.02), img[c].quantile(0.98)
-            img[c] = (img[c] - mn) / (mx - mn + 1e-8)
-        img = torch.clamp(img, 0, 1)
+        t_np = tensor.numpy()
+        vv = percentile_norm(t_np[0]) + 1e-16
+        vh = percentile_norm(t_np[1]) + 1e-16
+        return np.clip(np.stack([vv, vh, vv / vh], axis=-1), 0, 1)
     else:
-        # Default fallback
         img = tensor[:3]
         img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-    return img.permute(1, 2, 0).numpy()
+        return img.permute(1, 2, 0).numpy()
 
 
 def load_model_and_config(entry, device, modality):
-    """Parses 'Name=config_path:ckpt_path'."""
+    """Load model and return (name, model, norm_scheme, cfg)."""
     name, path_str = entry.split('=')
     cfg_path, ckpt_path = path_str.split(':') if ':' in path_str else (path_str, None)
 
+    print("Loading model:", name)
     cfg = OmegaConf.load(cfg_path)
     if 'terramind' in name.lower():
         model = build_terramind_model(modality)
+        norm_scheme = 'legacy'
     else:
         model = instantiate(cfg.model)
-
-    if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location='cpu')
-        state_dict = (
-            checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-        )
-        model.load_state_dict(state_dict, strict=False)
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f'  WARNING: Missing keys: {missing[:5]}...' if len(missing) > 5 else f'  WARNING: Missing keys: {missing}')
+        if unexpected:
+            print(f'  WARNING: Unexpected keys: {unexpected[:5]}...' if len(unexpected) > 5 else f'  WARNING: Unexpected keys: {unexpected}')
+        norm_scheme = get_norm_scheme(cfg)
+        
+        # Debug: Check BatchNorm stats if present
+        if hasattr(model, 'bn'):
+            print(f'  BN running_mean range: [{model.bn.running_mean.min():.3f}, {model.bn.running_mean.max():.3f}]')
+            print(f'  BN running_var range: [{model.bn.running_var.min():.3f}, {model.bn.running_var.max():.3f}]')
+
+    if name == 'EO-VAE-custom':
+        print("State dict keys containing 'bn':")
+        print([k for k in state_dict.keys() if 'bn' in k.lower()])
 
     model.to(device)
     model.eval()
+    return name, model, norm_scheme, cfg
 
-    # Extract norm method, default to zscore if missing
-    norm_method = cfg.datamodule.get('norm_method', 'zscore')
-    return name, model, norm_method
+
+def create_dataloader(cfg, modality, eval_batch_size=2):
+    """Create a dataloader with the config's normalization scheme."""
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    cfg.datamodule.val_collate_mode = modality
+    datamodule = instantiate(cfg.datamodule, eval_batch_size=eval_batch_size)
+    datamodule.setup('fit')
+    return datamodule.test_dataloader()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--base_config',
-        type=str,
-        required=True,
-        help='Config defining the Ground Truth data',
-    )
-    parser.add_argument(
-        '--models', nargs='+', required=True, help="List of 'Name=config.yaml:ckpt.pt'"
-    )
+    parser.add_argument('--base_config', type=str, required=True)
+    parser.add_argument('--models', nargs='+', required=True, help="List of 'Name=config.yaml:ckpt.pt'")
     parser.add_argument('--modality', type=str, default='S2L2A')
-    parser.add_argument('--batch_idx', type=int, default=0)
     parser.add_argument('--gpu', type=int, default=0)
+    
+    # New arguments for batch processing
+    parser.add_argument('--num_batches', type=int, default=100, help='Number of batches to visualize')
+    parser.add_argument('--out_dir', type=str, default='visual_results', help='Directory to save images')
+    
     args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    # 1. Setup Base Data (Ground Truth)
-    base_cfg = OmegaConf.load(args.base_config)
-    # Force validation settings
-    base_cfg.datamodule.val_collate_mode = args.modality
-    base_norm_method = base_cfg.datamodule.get('norm_method', 'zscore')
+    # 1. Load all models first
+    print('Loading models:')
+    models = [load_model_and_config(e, device, args.modality) for e in args.models]
+    for name, _, scheme, _ in models:
+        print(f'  {name}: norm_scheme={scheme}')
 
-    datamodule = instantiate(base_cfg.datamodule, eval_batch_size=8)
-    datamodule.setup('fit')
+    # 2. Group models by norm_scheme
+    scheme_to_models = {}
+    for name, model, scheme, cfg in models:
+        if scheme not in scheme_to_models:
+            scheme_to_models[scheme] = {'models': [], 'cfg': cfg}
+        scheme_to_models[scheme]['models'].append((name, model))
 
-    # Get specific batch
-    loader = datamodule.val_dataloader()
-    for i, batch in enumerate(loader):
-        if i == args.batch_idx:
-            base_images = batch['image'].to(device)
+    # 3. Initialize Iterators for each scheme
+    # We do this once to keep dataloaders persistent across the loop
+    scheme_iterators = {}
+    print("Initializing dataloaders...")
+    for scheme, group in scheme_to_models.items():
+        loader = create_dataloader(group['cfg'], args.modality)
+        scheme_iterators[scheme] = iter(loader)
+
+    # 4. Loop through batches
+    print(f"Starting visualization of {args.num_batches} batches...")
+    
+    for batch_idx in tqdm(range(args.num_batches)):
+        results = {}  # name -> raw tensor
+
+        # Run inference for each scheme group
+        for scheme, group in scheme_to_models.items():
+            try:
+                batch = next(scheme_iterators[scheme])
+            except StopIteration:
+                print(f"Dataloader for scheme '{scheme}' exhausted at batch {batch_idx}.")
+                break
+                
+            images = batch['image'].to(device)
             wvs = batch['wvs'].to(device) if 'wvs' in batch else None
-            break
 
-    # 2. Inference Loop
-    results = {}  # Stores RAW (unnormalized) reconstructions
+            with torch.no_grad():
+                # Store GT for this scheme (only if not already present from another compatible scheme)
+                gt_key = f'GT ({scheme})'
+                results[gt_key] = unnormalize(images, args.modality, scheme, device)
 
-    with torch.no_grad():
-        # Get Ground Truth in Raw space
-        gt_raw = unnormalize_image(base_images, args.modality, method=base_norm_method)
-        results['Ground Truth'] = gt_raw
+                for name, model in group['models']:
+                    if 'TerraMind' in name:
+                        recon = model(images, timesteps=20)
+                    elif 'Refiner' in name:
+                        recon = model(images, wvs)
+                    else:
+                        if hasattr(model, 'reconstruct'):
+                            recon = model.reconstruct(images, wvs)
+                        else:
+                            recon, _ = model(images, wvs)
 
-        for entry in args.models:
-            name, model, model_norm_method = load_model_and_config(
-                entry, device, modality=args.modality
-            )
+                    # Unnormalize with the same scheme used for input
+                    results[name] = unnormalize(recon, args.modality, scheme, device)
 
-            # A. Bridge: Base Norm -> Raw -> Model Norm
-            # If base and model use same method, skip unnorm/norm steps for speed
-            if base_norm_method == model_norm_method:
-                model_input = base_images
-            else:
-                model_input = normalize_image(
-                    gt_raw, args.modality, method=model_norm_method
-                )
+        # 5. Plot Logic
+        gt_keys = [k for k in results if k.startswith('GT')]
+        
+        # Consolidate GT: Use the first one found as the display Truth
+        if gt_keys:
+            results['Ground Truth'] = results.pop(gt_keys[0])
+            for k in gt_keys[1:]:
+                results.pop(k, None)
+        
+        # Ensure 'Ground Truth' is the last key for consistency
+        keys = [k for k in results if k != 'Ground Truth'] + ['Ground Truth']
+        
+        # Setup Figure
+        B = results['Ground Truth'].shape[0]
+        cols = len(results)
+        
+        # Calculate figure size dynamically
+        fig, axes = plt.subplots(B, cols, figsize=(4 * cols, 4 * B))
+        plt.subplots_adjust(wspace=0.05, hspace=0.1)
 
-            # B. Forward Pass
-            # Detect model API (TerraMind vs EO-VAE)
-            if 'TerraMind' in name:
-                recon = model(model_input, timesteps=20)
-            elif 'Refiner' in name:
-                recon = model(model_input, wvs)
-            else:
-                try:
-                    # Try Standard VAE encode/decode
-                    z = model.encode(model_input, wvs).mode()
-                    # Some VAEs require explicit normalization of latents
-                    if hasattr(model, 'normalize_latent'):
-                        z_shuffled = rearrange(
-                            z,
-                            '... c (i pi) (j pj) -> ... (c pi pj) i j',
-                            pi=model.ps[0],
-                            pj=model.ps[1],
-                        )
-                        z = model.normalize_latent(z_shuffled)
-                    recon = model.decode(z, wvs)
-                except:
-                    # Fallback
-                    recon = model(model_input, wvs)[0]
+        if B == 1:
+            axes = axes[None, :]
+        if cols == 1:
+            axes = axes[:, None]
 
-            # C. Un-normalize back to Raw Space for visual comparison
-            results[name] = unnormalize_image(
-                recon, args.modality, method=model_norm_method
-            )
+        for b in range(B):
+            for c, name in enumerate(keys):
+                ax = axes[b, c]
+                ax.imshow(get_display_image(results[name][b], args.modality))
+                if b == 0:
+                    ax.set_title(name, fontsize=16)
+                ax.axis('off')
 
-    # 3. Plotting
-    B = base_images.shape[0]
-    cols = len(results)
-    fig, axes = plt.subplots(B, cols, figsize=(4 * cols, 4 * B))
-    plt.subplots_adjust(wspace=0.05, hspace=0.1)
+        # Save and Close
+        out_path = os.path.join(args.out_dir, f'batch_{batch_idx:03d}.png')
+        plt.savefig(out_path, bbox_inches='tight')
+        plt.close(fig)  # Crucial: Close figure to prevent memory leak
 
-    # Ensure axes is 2D array
-    if B == 1:
-        axes = axes[None, :]
-    if cols == 1:
-        axes = axes[:, None]
-
-    # Order keys so GT is last
-    keys = [k for k in results.keys() if k != 'Ground Truth'] + ['Ground Truth']
-
-    for b in range(B):
-        for c, name in enumerate(keys):
-            ax = axes[b, c]
-
-            # Convert raw tensor to RGB numpy
-            img_disp = get_display_image(results[name][b], args.modality)
-
-            ax.imshow(img_disp)
-            if b == 0:
-                ax.set_title(name, fontsize=14, fontweight='bold')
-            ax.axis('off')
-
-    out_path = f'visual_comp_{args.modality}.png'
-    plt.savefig(out_path, bbox_inches='tight')
-    print(f'Visualization saved to {out_path}')
+    print(f'\nDone. Saved {args.num_batches} images to {args.out_dir}')
 
 
 if __name__ == '__main__':
