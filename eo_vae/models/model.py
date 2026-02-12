@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .modules.dynamic_basis import DynamicInputLayer, DynamicOutputLayer
 from .modules.dynamic_conv import DynamicConv, DynamicConv_decoder
 from .modules.layers import AttnBlock, Downsample, ResnetBlock, Upsample
 
@@ -102,7 +101,7 @@ class Encoder(nn.Module):
                 self.cond_dim = 512
                 self.conditioner = WavelengthConditioner(embed_dim=self.cond_dim)
 
-            mode = dynamic_kwargs.pop('mode', 'conv')  # 'conv' or 'basis'
+            dynamic_kwargs.pop('mode', 'conv')
 
             # ...existing code...
             wv_planes = dynamic_kwargs.pop('wv_planes', 128)
@@ -310,7 +309,7 @@ class Decoder(nn.Module):
             # Remove use_adain from kwargs passed to dynamic layers
             dynamic_kwargs.pop('use_adain', None)
 
-            mode = dynamic_kwargs.pop('mode', 'conv')
+            dynamic_kwargs.pop('mode', 'conv')
 
             wv_planes = dynamic_kwargs.pop('wv_planes', 128)
             inter_dim = dynamic_kwargs.pop('inter_dim', 128)
