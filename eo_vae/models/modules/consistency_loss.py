@@ -481,6 +481,3 @@ class EOConsistencyLoss(nn.Module):
 
         logs[f'{split}/loss_total'] = total_loss.detach()
         return total_loss, logs
-
-
-# ...existing code...

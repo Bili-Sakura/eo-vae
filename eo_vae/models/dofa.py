@@ -365,10 +365,7 @@ class OFAViT(nn.Module):
         # embed patches
         wavelist = torch.tensor(wave_list, device=x.device).float()
         self.waves = wavelist
-        # TODO #1 how to convert coordinates to higher dimension
         x, _ = self.patch_embed(x, self.waves)
-
-        hw = self.img_size // self.patch_embed.kernel_size
 
         # add pos embed w/o cls token
         x = x + self.pos_embed[:, 1:, :]

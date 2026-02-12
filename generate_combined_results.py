@@ -286,7 +286,7 @@ def main():
     print(f'Generated LaTeX table: {latex_path}')
 
     # Generate compact LaTeX table with bold best values
-    generate_compact_latex_table(combined, latex_path)
+    compact_latex = generate_compact_latex_table(combined, latex_path)
     compact_path = latex_path.replace('.tex', '_compact.tex')
     print(f'Generated compact LaTeX table: {compact_path}')
 
