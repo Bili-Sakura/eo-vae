@@ -26,6 +26,8 @@ pip install -e .
 
 ### Using a pretrained checkpoint (Inference)
 
+#### Option 1: Native checkpoint (EOFluxVAE)
+
 Use the built-in config-driven loader to avoid manual `Encoder`/`Decoder` construction.
 
 ```python
@@ -46,6 +48,30 @@ wvs = torch.tensor([0.665, 0.56, 0.49], dtype=torch.float32)  # example for S2RG
 with torch.no_grad():
     recon = model.reconstruct(x, wvs)                # [B, 3, 256, 256]
     z = model.encode_spatial_normalized(x, wvs)      # [B, 32, 32, 32] for 256x256 input
+```
+
+#### Option 2: Diffusers-style (HuggingFace)
+
+A pre-converted EO-VAE in [HuggingFace/diffusers](https://github.com/huggingface/diffusers) format is available at **[BiliSakura/EO-VAE](https://huggingface.co/BiliSakura/EO-VAE)**. This format is convenient for integration with diffusers pipelines.
+
+```python
+import torch
+from eo_vae.models.diffusers_vae import EOVAEDiffusersModel, WAVELENGTHS
+
+# Load from HuggingFace (no conversion needed)
+vae = EOVAEDiffusersModel.from_pretrained(
+    "BiliSakura/EO-VAE",
+    torch_dtype=torch.float32,
+    device="cpu",
+)
+
+# Example: S2 RGB
+x = torch.randn(1, 3, 256, 256)
+wvs = torch.tensor(WAVELENGTHS["S2RGB"], dtype=torch.float32)
+
+with torch.no_grad():
+    recon = vae.reconstruct(x, wvs)
+    z = vae.encode_spatial_normalized(x, wvs)  # [1, 32, 32, 32]
 ```
 
 These are the wavelengths used across modalities:
