@@ -84,12 +84,10 @@ def convert_eo_vae(
         print(f"Warning: unexpected keys: {len(unexpected)}")
 
     model.save_pretrained(output_path, safe_serialization=True)
-    shutil.copy(config_path, output_path / "model_config.yaml")
 
     print(f"Converted EO-VAE to {output_path}")
     print("  - config.json")
     print("  - model.safetensors")
-    print("  - model_config.yaml")
 
 
 def main():
